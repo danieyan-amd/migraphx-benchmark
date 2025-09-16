@@ -53,13 +53,12 @@ jobs:
   onnx_test:
     name: MIGraphX ONNX Model Zoo
     if: ${{ !contains(github.event.pull_request_target.labels.*.name, 'skip bot checks') }}
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, Linux, X64, gpu942f]
     timeout-minutes: 120
     outputs:
       git_sha: ${{ steps.git_sha.outputs.git_sha }}
 
     steps:
-      # --- cleanup like perf (stop leftover containers from canceled runs)
       - name: Clean up canceled runs
         continue-on-error: true
         shell: bash
@@ -83,22 +82,25 @@ jobs:
             | jq -s '.[2].id' || true)
           docker stop onnx-test-$cancel_id || true
 
-      # --- map runner to GPU/CPU like perf
+      # ✅ Quick fix: map your runner name `gpu942f` to GPU=0 / CPU=0-63 (and keep originals)
       - name: Get runner ID
         shell: bash
         run: |
-          case "$RUNNER_NAME" in
-            "GPU942F_1")
+          set -euo pipefail
+          NAME="${RUNNER_NAME:-unknown}"
+          case "$NAME" in
+            GPU942F_1|gpu942f)
               GPU=0
               CPU="0-63"
               ;;
-            "GPU942F_2")
+            GPU942F_2)
               GPU=4
               CPU="64-127"
               ;;
             *)
-              echo "Unknown RUNNER_ID: $RUNNER_NAME"
-              exit 1
+              echo "Unknown RUNNER_NAME: $NAME — defaulting to GPU=0, all CPUs"
+              GPU=0
+              CPU="0-$(( $(nproc) - 1 ))"
               ;;
           esac
           echo "GPU=$GPU" >> $GITHUB_ENV
@@ -112,7 +114,6 @@ jobs:
         if: ${{ github.event.action != 'closed' }}
         run: pip install tabulate==0.8.9 pandas==1.4.2 numpy==1.22.3 openpyxl==3.1.2
 
-      # --- adjust env for PRs like perf
       - name: Update PR env
         if: ${{ github.event_name == 'pull_request_target' }}
         shell: bash
@@ -121,7 +122,6 @@ jobs:
           echo "BRANCH_NAME=$sanitized_branch_name" >> $GITHUB_ENV
           echo "TEST_RESULTS_PATH=$(echo "$TEST_RESULTS_PATH-$PR_ID")" >> $GITHUB_ENV
 
-      # --- checkout the code-under-test (AMDMIGraphX) exactly like perf
       - name: Checkout code (AMDMIGraphX)
         if: ${{ github.event.action != 'closed' }}
         uses: actions/checkout@v4
@@ -131,7 +131,6 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           token: ${{ secrets.gh_token || github.token }}
 
-      # --- checkout the utils repo (required)
       - name: Checkout utils (migraphx-benchmark-utils)
         if: ${{ github.event.action != 'closed' }}
         uses: actions/checkout@v4
@@ -140,7 +139,6 @@ jobs:
           path: ${{ env.UTILS_DIR }}
           token: ${{ secrets.gh_token }}
 
-      # --- compute build hash like perf
       - name: Calculate HASH
         if: ${{ github.event.action != 'closed' }}
         id: hash
@@ -188,7 +186,6 @@ jobs:
           cd $GITHUB_WORKSPACE/${{ env.UTILS_DIR }}/scripts
           ./build_migraphx_docker.sh ${{ inputs.benchmark_utils_repo }} ${{ github.event.pull_request.head.repo.full_name || github.repository }} ${{ env.BRANCH_NAME }}
 
-      # --- build the test image from utils dockerfiles (like perf)
       - name: Docker build (utils Daily.Dockerfile)
         if: ${{ github.event.action != 'closed' }}
         shell: bash
@@ -201,7 +198,6 @@ jobs:
           -t "migraphx-rocm:${{ inputs.rocm_release }}-${{ steps.git_sha.outputs.git_sha }}"
           -f dockerfiles/Daily.Dockerfile .
 
-      # --- run ONNX tests inside the container (perf-style mounts)
       - name: Run ONNX model-zoo
         if: ${{ github.event.action != 'closed' }}
         shell: bash
@@ -229,10 +225,8 @@ jobs:
           --workdir /workspace
           migraphx-rocm:${{ inputs.rocm_release }}-${{ steps.git_sha.outputs.git_sha }} /bin/bash -lc "
             set -euo pipefail
-            # Build MIGraphX inside image (same as perf)
             /migraphx/sh/build_migraphx.sh
 
-            # Ensure Node 20 (perf images don't include it)
             if ! command -v node >/dev/null 2>&1; then
               apt-get update -y
               apt-get install -y --no-install-recommends ca-certificates curl gnupg
@@ -243,9 +237,8 @@ jobs:
             fi
             node --version
 
-            # Install test deps (avoid CUDA wheels)
             if [ -f tools/model_zoo/test_generator/requirements.txt ]; then
-              grep -viE '^(torch|torchvision|torchaudio|onnxruntime-gpu)\b' tools/model_zoo/test_generator/requirements.txt > .req_notorch.txt || true
+              grep -viE '^(torch|torchvision|torchaudio|onnxruntime-gpu)\\b' tools/model_zoo/test_generator/requirements.txt > .req_notorch.txt || true
               pip3 install -r .req_notorch.txt
             fi
 
@@ -264,17 +257,18 @@ jobs:
             echo 'Running ONNX model tests...'
             bash tools/model_zoo/test_generator/test_models.sh tools/model_zoo/onnx_zoo 2>&1 | tee \"${ROOT}/raw.log\"
 
-            # copy per-precision logs
             shopt -s nullglob
             for p in fp16 fp32; do
               src=\"tools/model_zoo/test_generator/logs/$p\"
               [ -d \"$src\" ] && cp -f \"$src\"/*.log \"${ROOT}/$p/\" || true
             done
 
-            # summarize
             node - <<'JS'
             const fs=require('fs'),path=require('path');
-            const root=process.env.ROOT||process.argv[2]; const precs=['fp32','fp16'];
+            const root=process.env.ROOT||process.argv[2]||process.env.PWD+'/data/test-results'.replace('/data/test-results','')+'/data/test-results'; // fallback not used but harmless
+            const runBase=process.env.RUN_TS?(`/data/test-results/onnx-${process.env.RUN_TS}`):null;
+            const dir=runBase||process.argv[2];
+            const precs=['fp32','fp16'];
             const summary={totals:{pass:0,fail:0},regressions:{}};
             function looksFailed(t){return /(Traceback \\(most recent call last\\)|\\bERROR\\b|AssertionError|Segmentation fault|^error:)/im.test(t);}
             function failureMessage(t){
@@ -285,8 +279,9 @@ jobs:
               for(const l of lines) if (/(error|exception|failed|segmentation fault|assert)/i.test(l)) return l;
               return 'failed (see log)';
             }
+            const rootDir = process.env.ROOT || process.env.RUN_TS ? `/data/test-results/onnx-${process.env.RUN_TS}` : dir;
             for(const prec of precs){
-              const d=path.join(root,prec); const reg={passed:[],failed:[]};
+              const d=path.join(rootDir,prec); const reg={passed:[],failed:[]};
               if(fs.existsSync(d)&&fs.statSync(d).isDirectory()){
                 const files=fs.readdirSync(d).filter(f=>f.endsWith('.log')).sort();
                 for(const fn of files){
@@ -298,7 +293,7 @@ jobs:
               }
               summary.regressions[prec]=reg;
             }
-            fs.writeFileSync(path.join(root,'summary.json'), JSON.stringify(summary,null,2));
+            fs.writeFileSync(path.join(rootDir,'summary.json'), JSON.stringify(summary,null,2));
             const lines=[];
             lines.push('## Totals',`- PASS: ${summary.totals.pass}`,`- FAIL: ${summary.totals.fail}`,'');
             for(const prec of precs){
@@ -311,11 +306,10 @@ jobs:
               if(reg.failed.length) reg.failed.forEach(it=>lines.push(`- ${it.model}: \\`${it.message}\\``)); else lines.push('- none');
               lines.push('');
             }
-            fs.writeFileSync(path.join(root,'summary.md'), lines.join('\\n'));
+            fs.writeFileSync(path.join(rootDir,'summary.md'), lines.join('\\n'));
             JS
           "
 
-      # --- delete old images on nightly like perf (optional)
       - name: Delete old images/containers
         if: ${{ github.event_name == 'schedule' }}
         shell: bash
@@ -329,7 +323,6 @@ jobs:
           fi
           docker image prune -f || true
 
-      # --- copy results to onnx reports repo (mirror perf layout)
       - name: Checkout report's repo
         if: ${{ github.event.action != 'closed' }}
         uses: actions/checkout@v4
@@ -366,7 +359,6 @@ jobs:
           git commit -m "ONNX results run https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" -a || true
           git push || true
 
-      # --- sticky PR comment with summary
       - name: Create ONNX comment on PR
         if: ${{ github.event_name != 'schedule' && github.event_name == 'pull_request_target' && github.event.action != 'closed' }}
         uses: marocchino/sticky-pull-request-comment@v2.9.0
