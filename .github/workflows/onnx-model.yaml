@@ -3,16 +3,31 @@ name: ONNX Model Zoo Tests (SMOKE)
 on:
   workflow_call:
     inputs:
-      rocm_release:        {type: string, required: true}
-      onnx_reports_repo:   {type: string, required: true}
-      benchmark_utils_repo:{type: string, required: true}
-      organization:        {type: string, required: true}
-      result_number:       {type: string, required: true}
-      model_timeout:       {type: string, required: true}
+      rocm_release:
+        type: string
+        required: true
+      onnx_reports_repo:
+        type: string
+        required: true
+      benchmark_utils_repo:
+        type: string
+        required: true
+      organization:
+        type: string
+        required: true
+      result_number:
+        type: string
+        required: true
+      model_timeout:
+        type: string
+        required: true
     secrets:
-      gh_token:  {required: true}
-      mail_user: {required: true}
-      mail_pass: {required: true}
+      gh_token:
+        required: true
+      mail_user:
+        required: true
+      mail_pass:
+        required: true
 
 permissions:
   contents: read
