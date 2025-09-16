@@ -53,7 +53,7 @@ jobs:
   onnx_test:
     name: MIGraphX ONNX Model Zoo
     if: ${{ !contains(github.event.pull_request_target.labels.*.name, 'skip bot checks') }}
-    runs-on: [self-hosted, Linux, X64, gpu942f]
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 120
     outputs:
       git_sha: ${{ steps.git_sha.outputs.git_sha }}
