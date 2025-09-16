@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   smoke:
-    runs-on: [self-hosted, Linux, X64, gpu942f]
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
         with:
