@@ -33,10 +33,10 @@ permissions:
   contents: read
 
 env:
-  DATASETS_DIR: /usr/share/migraphx/migraph_datasets
-  PYTHONPATH: /opt/rocm/lib:${PYTHONPATH}
-  LD_LIBRARY_PATH: /opt/rocm/lib:${LD_LIBRARY_PATH}
-  DOCKER_IMAGE: onnx-model:${{ github.sha }}
+  DATASETS_DIR: "/usr/share/migraphx/migraph_datasets"
+  PYTHONPATH: "/opt/rocm/lib:${PYTHONPATH}"
+  LD_LIBRARY_PATH: "/opt/rocm/lib:${LD_LIBRARY_PATH}"
+  DOCKER_IMAGE: "onnx-model:${{ github.sha }}"
 
 jobs:
   model-zoo-tests:
@@ -52,18 +52,22 @@ jobs:
 
       # If your Dockerfile is NOT at repo root, change "-f" to the correct path.
       - name: Build MIGraphX image
+        shell: bash
         run: |
+          set -euo pipefail
           docker build -t "$DOCKER_IMAGE" -f Dockerfile .
 
       - name: Init timestamp
         id: ts
+        shell: bash
         run: echo "stamp=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
 
       - name: Run ONNX model tests inside container
         env:
           RUN_TS: ${{ steps.ts.outputs.stamp }}
+        shell: bash
         run: |
-          # ensure host-side folder exists to collect logs
+          set -euo pipefail
           mkdir -p "logs/${RUN_TS}"
 
           docker run --rm \
@@ -82,14 +86,12 @@ jobs:
             bash -lc '
               set -euo pipefail
 
-              # Make sure Node and Python deps exist inside the container image.
-              # If your image already includes Node, this is a no-op; otherwise install it in the image.
-              # Ensure Python deps come from your repo:
+              # Install repo-pinned Python deps (inside container)
               if [ -f tools/model_zoo/test_generator/requirements.txt ]; then
                 pip3 install -r tools/model_zoo/test_generator/requirements.txt
               fi
 
-              # Ensure scripts are executable and logs dirs exist
+              # Ensure scripts & logs dirs exist
               chmod +x tools/model_zoo/test_generator/test_models.sh || true
               chmod +x ./run-model-zoo-tests.js || true
               mkdir -p "logs/${RUN_TS}/fp16" "logs/${RUN_TS}/fp32"
