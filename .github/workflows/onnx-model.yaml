@@ -1,4 +1,4 @@
-name: ONNX Model Zoo Tests (Thin Docker)
+name: MIGraphX ONNX Model Tests (perf-structured)
 
 on:
   workflow_call:
@@ -7,6 +7,9 @@ on:
         type: string
         required: true
       onnx_reports_repo:
+        type: string
+        required: true
+      benchmark_utils_repo:
         type: string
         required: true
       organization:
@@ -30,170 +33,354 @@ permissions:
   contents: read
 
 env:
-  DATASETS_DIR: /usr/share/migraphx/migraph_datasets
-  ROCM_DIR: /opt/rocm
-  DOCKER_IMAGE: onnx-model-thin:${{ github.sha }}
+  # perf-style env
+  UTILS_DIR: benchmark-utils
+  REPORTS_DIR: migraphx-reports
+  DOCKERBASE: rocm-migraphx:${{ inputs.rocm_release }}
+  MIOPENTUNE: miopen-dbs/rocm${{ inputs.rocm_release }}
+  MAIL_TO: ""
+  MAIL_CC: ""
+  MAIL_FROM: GH Actions
+  MAIL_SUBJECT: Nightly ONNX run
+  MAIL_BODY: Scheduled ONNX run on develop branch
+  PR_ID: ${{ github.event.number }}
+  BRANCH_NAME: develop
+  REPORTS_PATH: /usr/share/migraphx/${{ inputs.organization }}/reports
+  TEST_RESULTS_PATH: /usr/share/migraphx/${{ inputs.organization }}/test-results
+  MIGRAPHX_PATH: /usr/share/migraphx/${{ inputs.organization }}
 
 jobs:
-  model-zoo-tests:
+  onnx_test:
+    name: MIGraphX ONNX Model Zoo
+    if: ${{ !contains(github.event.pull_request_target.labels.*.name, 'skip bot checks') }}
     runs-on: [self-hosted, Linux, X64, gpu942f]
-    timeout-minutes: 60
+    timeout-minutes: 120
+    outputs:
+      git_sha: ${{ steps.git_sha.outputs.git_sha }}
 
     steps:
-      - name: Checkout sources (caller repo)
+      # --- cleanup like perf (stop leftover containers from canceled runs)
+      - name: Clean up canceled runs
+        continue-on-error: true
+        shell: bash
+        run: |
+          wf_id=$(curl -H "Authorization: token ${{ secrets.gh_token }}" \
+            ${{ github.api_url }}/repos/${{ github.repository }}/actions/workflows \
+            | jq -r '.workflows[] | {id, name}| select(.name == "${{ github.workflow }}") | .id')
+          cancel_id=$(curl -H "Authorization: token ${{ secrets.gh_token }}" \
+            ${{ github.api_url }}/repos/${{ github.repository }}/actions/workflows/$wf_id/runs?per_page=10 \
+            | jq -r '.workflow_runs[] | {id, run_number, conclusion} | select(.conclusion == "cancelled") | {id, run_number}' \
+            | jq -s '.[0].id' || true)
+          docker stop onnx-test-$cancel_id || true
+          cancel_id=$(curl -H "Authorization: token ${{ secrets.gh_token }}" \
+            ${{ github.api_url }}/repos/${{ github.repository }}/actions/workflows/$wf_id/runs?per_page=10 \
+            | jq -r '.workflow_runs[] | {id, run_number, conclusion} | select(.conclusion == "cancelled") | {id, run_number}' \
+            | jq -s '.[1].id' || true)
+          docker stop onnx-test-$cancel_id || true
+          cancel_id=$(curl -H "Authorization: token ${{ secrets.gh_token }}" \
+            ${{ github.api_url }}/repos/${{ github.repository }}/actions/workflows/$wf_id/runs?per_page=10 \
+            | jq -r '.workflow_runs[] | {id, run_number, conclusion} | select(.conclusion == "cancelled") | {id, run_number}' \
+            | jq -s '.[2].id' || true)
+          docker stop onnx-test-$cancel_id || true
+
+      # --- map runner to GPU/CPU like perf
+      - name: Get runner ID
+        shell: bash
+        run: |
+          case "$RUNNER_NAME" in
+            "GPU942F_1")
+              GPU=0
+              CPU="0-63"
+              ;;
+            "GPU942F_2")
+              GPU=4
+              CPU="64-127"
+              ;;
+            *)
+              echo "Unknown RUNNER_ID: $RUNNER_NAME"
+              exit 1
+              ;;
+          esac
+          echo "GPU=$GPU" >> $GITHUB_ENV
+          echo "CPU=$CPU" >> $GITHUB_ENV
+
+      - name: Set GPU parameters
+        if: ${{ github.event.action != 'closed' }}
+        run: sudo rocm-smi --device ${{ env.GPU }} --setsrange 700 800 --autorespond y
+
+      - name: Install small python libs (host)
+        if: ${{ github.event.action != 'closed' }}
+        run: pip install tabulate==0.8.9 pandas==1.4.2 numpy==1.22.3 openpyxl==3.1.2
+
+      # --- adjust env for PRs like perf
+      - name: Update PR env
+        if: ${{ github.event_name == 'pull_request_target' }}
+        shell: bash
+        run: |
+          sanitized_branch_name=$(echo "${{ github.head_ref }}" | sed 's/[^a-zA-Z0-9._\/]/-/g')
+          echo "BRANCH_NAME=$sanitized_branch_name" >> $GITHUB_ENV
+          echo "TEST_RESULTS_PATH=$(echo "$TEST_RESULTS_PATH-$PR_ID")" >> $GITHUB_ENV
+
+      # --- checkout the code-under-test (AMDMIGraphX) exactly like perf
+      - name: Checkout code (AMDMIGraphX)
+        if: ${{ github.event.action != 'closed' }}
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
+          ref: ${{ env.BRANCH_NAME }}
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
-          ref: ${{ github.event.pull_request.head.ref || 'develop' }}
-          fetch-depth: 1
           token: ${{ secrets.gh_token || github.token }}
 
-      - name: Write thin Dockerfile
+      # --- checkout the utils repo (required)
+      - name: Checkout utils (migraphx-benchmark-utils)
+        if: ${{ github.event.action != 'closed' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.benchmark_utils_repo }}
+          path: ${{ env.UTILS_DIR }}
+          token: ${{ secrets.gh_token }}
+
+      # --- compute build hash like perf
+      - name: Calculate HASH
+        if: ${{ github.event.action != 'closed' }}
+        id: hash
         shell: bash
         run: |
-          set -euo pipefail
-          mkdir -p .ci
-          cat > .ci/Thin.Dockerfile <<'DOCKER'
-          FROM ubuntu:22.04
-          ARG DEBIAN_FRONTEND=noninteractive
-          RUN apt-get update && apt-get install -y --no-install-recommends \
-                ca-certificates curl gnupg \
-                python3 python3-pip python3-venv python3-dev \
-                build-essential git pkg-config \
-            && rm -rf /var/lib/apt/lists/*
-          RUN python3 -m pip install --upgrade pip wheel
-          WORKDIR /workspace
-          DOCKER
+          cd $GITHUB_WORKSPACE
+          git checkout $BRANCH_NAME
+          rocm_hash=$(echo ${{hashFiles('**/Dockerfile', '**/hip-clang.docker', '**/*requirements.txt', '**/requirements-py.txt', '**/install_prereqs.sh', '**/rbuild.ini')}} | cut -c 1-6)
+          echo "HASH=$rocm_hash" >> $GITHUB_ENV
 
-      - name: Build thin image (no ROCm inside)
+      - name: Get git SHA
+        if: ${{ github.event.action != 'closed' }}
+        id: git_sha
         shell: bash
         run: |
-          set -euo pipefail
-          docker build -t "$DOCKER_IMAGE" -f .ci/Thin.Dockerfile .
+          cd $GITHUB_WORKSPACE
+          git checkout $BRANCH_NAME
+          SHA=$(git log | head -5 | grep -m 1 "^commit" | awk '{print $2}' | cut -c 1-6)
+          echo "git_sha=$SHA" >> $GITHUB_OUTPUT
 
-      - name: Init timestamp
-        id: ts
+      - name: Check image hash
+        if: ${{ github.event.action != 'closed' }}
+        id: check_hash
         shell: bash
-        run: echo "stamp=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo ${{ env.HASH }}
+          echo "DOCKERBASE=rocm-migraphx:${{ inputs.rocm_release }}-${{ env.HASH }}" >> $GITHUB_ENV
+          if [ -z "$(docker images -q rocm-migraphx:${{ inputs.rocm_release }}-${{ env.HASH }})" ]; then
+            echo "Hashes not match, base ROCm image will be rebuilt"
+            echo "image=true" >> $GITHUB_ENV
+          else 
+            echo "Hashes match, continue with existing image"
+            echo "image=false" >> $GITHUB_ENV
+          fi
 
-      - name: Run ONNX model tests (host ROCm mounted)
+      - name: Rebuild ROCm base (utils script)
+        if: ${{ env.image == 'true' }}
+        env:
+          ROCM_RELEASE: ${{ inputs.rocm_release }}
+          DOCKERIMAGE: rocm-migraphx:${{ inputs.rocm_release }}-${{ env.HASH }}
+          BUILD_NAVI: 0
+          TOKEN: ${{ secrets.gh_token }}
+        shell: bash
+        run: |
+          cd $GITHUB_WORKSPACE/${{ env.UTILS_DIR }}/scripts
+          ./build_migraphx_docker.sh ${{ inputs.benchmark_utils_repo }} ${{ github.event.pull_request.head.repo.full_name || github.repository }} ${{ env.BRANCH_NAME }}
+
+      # --- build the test image from utils dockerfiles (like perf)
+      - name: Docker build (utils Daily.Dockerfile)
+        if: ${{ github.event.action != 'closed' }}
+        shell: bash
+        run: >
+          cd $GITHUB_WORKSPACE/${{ env.UTILS_DIR }} && docker build
+          --build-arg BRANCH=${{ env.BRANCH_NAME }}
+          --build-arg DOCKERBASE=${{ env.DOCKERBASE }}
+          --build-arg MIOPENTUNE=${{ env.MIOPENTUNE }}
+          --build-arg benchmark_utils_repo=${{ inputs.benchmark_utils_repo }}
+          -t "migraphx-rocm:${{ inputs.rocm_release }}-${{ steps.git_sha.outputs.git_sha }}"
+          -f dockerfiles/Daily.Dockerfile .
+
+      # --- run ONNX tests inside the container (perf-style mounts)
+      - name: Run ONNX model-zoo
+        if: ${{ github.event.action != 'closed' }}
         shell: bash
         env:
-          RUN_TS: ${{ steps.ts.outputs.stamp }}
-        run: |
-          set -euo pipefail
-          mkdir -p "logs/${RUN_TS}"
+          GPU: ${{ env.GPU }}
+          CPU: ${{ env.CPU }}
+        run: >
+          docker run
+          --name onnx-test-$GITHUB_RUN_ID
+          --cpuset-cpus=${{ env.CPU }}
+          -e ROCR_VISIBLE_DEVICES=${{ env.GPU }}
+          -e TZ=America/Chicago
+          -e TARGET=gpu
+          -e PYTHONPATH=/src/AMDMIGraphX/build/lib
+          -e USE_RBUILD=1
+          --device=/dev/dri
+          --device=/dev/kfd
+          --network=host
+          --group-add=video
+          -v /usr/share/migraphx/saved-models:/saved-models:ro
+          -v /usr/share/migraphx/new-saved-models:/new-saved-models:ro
+          -v $GITHUB_WORKSPACE/${{ env.UTILS_DIR }}/scripts:/migraphx/sh:ro
+          -v ${{ env.TEST_RESULTS_PATH }}:/data/test-results
+          -v $GITHUB_WORKSPACE:/workspace
+          --workdir /workspace
+          migraphx-rocm:${{ inputs.rocm_release }}-${{ steps.git_sha.outputs.git_sha }} /bin/bash -lc "
+            set -euo pipefail
+            # Build MIGraphX inside image (same as perf)
+            /migraphx/sh/build_migraphx.sh
 
-          docker run --rm \
-            --name "onnx-model-${GITHUB_RUN_ID}" \
-            --device=/dev/dri --device=/dev/kfd \
-            --network=host --group-add=video \
-            -e TARGET=gpu \
-            -e ATOL=0.001 \
-            -e RTOL=0.001 \
-            -e RUN_TS="${RUN_TS}" \
-            -e PYTHONPATH="/opt/rocm/lib:${PYTHONPATH:-}" \
-            -e LD_LIBRARY_PATH="/opt/rocm/lib:${LD_LIBRARY_PATH:-}" \
-            -v "${ROCM_DIR}:/opt/rocm:ro" \
-            -v "${DATASETS_DIR}:/datasets:ro" \
-            -v "$GITHUB_WORKSPACE:/workspace" \
-            -w /workspace \
-            "$DOCKER_IMAGE" \
-            bash -lc "
-              set -euo pipefail
-
-              # --- Install Node.js 20 INSIDE the container (runtime hotfix) ---
+            # Ensure Node 20 (perf images don't include it)
+            if ! command -v node >/dev/null 2>&1; then
               apt-get update -y
               apt-get install -y --no-install-recommends ca-certificates curl gnupg
               install -d /etc/apt/keyrings
-              curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
-                | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
-              echo 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main' \
-                > /etc/apt/sources.list.d/nodesource.list
+              curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+              echo 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main' > /etc/apt/sources.list.d/nodesource.list
               apt-get update -y && apt-get install -y --no-install-recommends nodejs
+            fi
+            node --version
 
-              # If your requirements.txt contains 'torch' (CUDA wheels) it will overwrite ROCm Torch.
-              # Either preinstall ROCm Torch or skip torch from requirements:
-              # pip3 install --index-url https://download.pytorch.org/whl/rocm6.4 torch torchvision torchaudio
-              # pip3 install -r tools/model_zoo/test_generator/requirements.txt --no-deps
-              # Or if torch isn't needed, just:
-              if [ -f tools/model_zoo/test_generator/requirements.txt ]; then
-                pip3 install -r tools/model_zoo/test_generator/requirements.txt
-              fi
+            # Install test deps (avoid CUDA wheels)
+            if [ -f tools/model_zoo/test_generator/requirements.txt ]; then
+              grep -viE '^(torch|torchvision|torchaudio|onnxruntime-gpu)\b' tools/model_zoo/test_generator/requirements.txt > .req_notorch.txt || true
+              pip3 install -r .req_notorch.txt
+            fi
 
-              chmod +x tools/model_zoo/test_generator/test_models.sh || true
-              chmod +x ./run-model-zoo-tests.js || true
-              mkdir -p 'logs/${RUN_TS}/fp16' 'logs/${RUN_TS}/fp32'
+            chmod +x tools/model_zoo/test_generator/test_models.sh || true
+            chmod +x ./run-model-zoo-tests.js || true
 
-              echo 'Datasets at /datasets'
-              node --version
-              node ./run-model-zoo-tests.js --datasets /datasets --out tools/model_zoo/onnx_zoo
+            RUN_TS=$(date -u +%Y%m%dT%H%M%SZ)
+            echo \"RUN_TS=$RUN_TS\"
+            ROOT=\"/data/test-results/onnx-${RUN_TS}\"
+            mkdir -p \"${ROOT}/fp16\" \"${ROOT}/fp32\"
+            echo \"${RUN_TS}\" > \"${ROOT}/run.timestamp\"
 
-              echo 'Running model zoo tests...'
-              bash tools/model_zoo/test_generator/test_models.sh tools/model_zoo/onnx_zoo 2>&1 | tee 'logs/${RUN_TS}/raw.log'
+            echo 'Generating ONNX test cases...'
+            node ./run-model-zoo-tests.js --datasets /saved-models --out tools/model_zoo/onnx_zoo
 
-              shopt -s nullglob
-              for p in fp16 fp32; do
-                src=\"tools/model_zoo/test_generator/logs/\$p\"
-                [ -d \"\$src\" ] && cp -f \"\$src\"/*.log 'logs/${RUN_TS}/'\"\$p\"'/' || true
-              done
+            echo 'Running ONNX model tests...'
+            bash tools/model_zoo/test_generator/test_models.sh tools/model_zoo/onnx_zoo 2>&1 | tee \"${ROOT}/raw.log\"
 
-              cat > .summary.js <<'EOS'
-              const fs = require('fs');
-              const path = require('path');
-              const runTs = process.env.RUN_TS;
-              const root = path.join('logs', runTs);
-              const precs = ['fp32','fp16'];
-              const summary = { totals:{pass:0,fail:0}, regressions:{} };
-              function looksFailed(text){
-                return /(Traceback \(most recent call last\)|\\bERROR\\b|AssertionError|Segmentation fault|^error:)/im.test(text);
-              }
-              function failureMessage(text){
-                const tb=[...text.matchAll(/Traceback \\(most recent call last\\):([\\s\\S]*?)(?:\\n\\s*\\n|\\Z)/g)];
-                if(tb.length){
-                  const block=tb[tb.length-1][1].trim().split(/\\r?\\n/).reverse();
-                  for(const line of block) if(line.trim()) return line.trim();
+            # copy per-precision logs
+            shopt -s nullglob
+            for p in fp16 fp32; do
+              src=\"tools/model_zoo/test_generator/logs/$p\"
+              [ -d \"$src\" ] && cp -f \"$src\"/*.log \"${ROOT}/$p/\" || true
+            done
+
+            # summarize
+            node - <<'JS'
+            const fs=require('fs'),path=require('path');
+            const root=process.env.ROOT||process.argv[2]; const precs=['fp32','fp16'];
+            const summary={totals:{pass:0,fail:0},regressions:{}};
+            function looksFailed(t){return /(Traceback \\(most recent call last\\)|\\bERROR\\b|AssertionError|Segmentation fault|^error:)/im.test(t);}
+            function failureMessage(t){
+              const tb=[...t.matchAll(/Traceback \\(most recent call last\\):([\\s\\S]*?)(?:\\n\\s*\\n|\\Z)/g)];
+              if(tb.length){const block=tb[tb.length-1][1].trim().split(/\\r?\\n/).reverse();
+                for(const line of block) if(line.trim()) return line.trim();}
+              const lines=t.split(/\\r?\\n/).map(l=>l.trim()).filter(Boolean).reverse();
+              for(const l of lines) if (/(error|exception|failed|segmentation fault|assert)/i.test(l)) return l;
+              return 'failed (see log)';
+            }
+            for(const prec of precs){
+              const d=path.join(root,prec); const reg={passed:[],failed:[]};
+              if(fs.existsSync(d)&&fs.statSync(d).isDirectory()){
+                const files=fs.readdirSync(d).filter(f=>f.endsWith('.log')).sort();
+                for(const fn of files){
+                  const model=fn.slice(0,-4);
+                  const txt=fs.readFileSync(path.join(d,fn),'utf8');
+                  if(looksFailed(txt)){reg.failed.push({model,message:failureMessage(txt)});summary.totals.fail++;}
+                  else {reg.passed.push(model);summary.totals.pass++;}
                 }
-                const lines=text.split(/\\r?\\n/).map(l=>l.trim()).filter(Boolean).reverse();
-                for(const l of lines) if (/(error|exception|failed|segmentation fault|assert)/i.test(l)) return l;
-                return 'failed (see log)';
               }
-              for (const prec of precs){
-                const d = path.join(root, prec);
-                const reg = { passed: [], failed: [] };
-                if (fs.existsSync(d) && fs.statSync(d).isDirectory()){
-                  const files = fs.readdirSync(d).filter(f => f.endsWith('.log')).sort();
-                  for (const fn of files){
-                    const model = fn.slice(0, -4);
-                    const txt = fs.readFileSync(path.join(d, fn), 'utf8');
-                    if (looksFailed(txt)){ reg.failed.push({ model, message: failureMessage(txt) }); summary.totals.fail++; }
-                    else { reg.passed.push(model); summary.totals.pass++; }
-                  }
-                }
-                summary.regressions[prec] = reg;
-              }
-              fs.writeFileSync(path.join(root, 'summary.json'), JSON.stringify(summary, null, 2));
-              const lines = [];
-              lines.push('## Totals', \`- PASS: \${summary.totals.pass}\`, \`- FAIL: \${summary.totals.fail}\`, '');
-              for (const prec of precs){
-                const reg = summary.regressions[prec];
-                lines.push(\`## \${prec.toUpperCase()}\`);
-                lines.push(\`**Passed (\${reg.passed.length})**\`);
-                if (reg.passed.length) reg.passed.forEach(m => lines.push(\`- \${m}\`)); else lines.push('- none');
-                lines.push('');
-                lines.push(\`**Failed (\${reg.failed.length})**\`);
-                if (reg.failed.length) reg.failed.forEach(it => lines.push(\`- \${it.model}: \\\`\${it.message}\\\`\`)); else lines.push('- none');
-                lines.push('');
-              }
-              fs.writeFileSync(path.join(root, 'summary.md'), lines.join('\\n'));
-              EOS
+              summary.regressions[prec]=reg;
+            }
+            fs.writeFileSync(path.join(root,'summary.json'), JSON.stringify(summary,null,2));
+            const lines=[];
+            lines.push('## Totals',`- PASS: ${summary.totals.pass}`,`- FAIL: ${summary.totals.fail}`,'');
+            for(const prec of precs){
+              const reg=summary.regressions[prec];
+              lines.push(`## ${prec.toUpperCase()}`);
+              lines.push(`**Passed (${reg.passed.length})**`);
+              if(reg.passed.length) reg.passed.forEach(m=>lines.push(`- ${m}`)); else lines.push('- none');
+              lines.push('');
+              lines.push(`**Failed (${reg.failed.length})**`);
+              if(reg.failed.length) reg.failed.forEach(it=>lines.push(`- ${it.model}: \\`${it.message}\\``)); else lines.push('- none');
+              lines.push('');
+            }
+            fs.writeFileSync(path.join(root,'summary.md'), lines.join('\\n'));
+            JS
+          "
 
-              node .summary.js
-            "
+      # --- delete old images on nightly like perf (optional)
+      - name: Delete old images/containers
+        if: ${{ github.event_name == 'schedule' }}
+        shell: bash
+        run: |
+          docker container prune -f || true
+          if [[ $(docker images --filter=reference="migraphx-rocm:${{ inputs.rocm_release }}-*" | awk 'NR>1 {print $3}') ]]; then
+            docker rmi -f $(docker images --filter=reference="migraphx-rocm:${{ inputs.rocm_release }}-*" | awk 'NR>1 {print $3}') || true
+          fi
+          if [[ $(docker images --format "{{.Repository}}:{{.Tag}} {{.CreatedAt}}" | grep "rocm-migraphx:${{ inputs.rocm_release }}-"|awk -v date="$(date -d '2 weeks ago' +%Y-%m-%d)" '$2 < date {print $1}') ]]; then
+            docker rmi -f $(docker images --format "{{.Repository}}:{{.Tag}} {{.CreatedAt}}" | grep "rocm-migraphx:${{ inputs.rocm_release }}-"|awk -v date="$(date -d '2 weeks ago' +%Y-%m-%d)" '$2 < date {print $1}') || true
+          fi
+          docker image prune -f || true
 
-      - name: Upload logs and summary
-        uses: actions/upload-artifact@v4
+      # --- copy results to onnx reports repo (mirror perf layout)
+      - name: Checkout report's repo
+        if: ${{ github.event.action != 'closed' }}
+        uses: actions/checkout@v4
         with:
-          name: model-zoo-logs-${{ steps.ts.outputs.stamp }}
-          path: logs/${{ steps.ts.outputs.stamp }}
-          if-no-files-found: error
+          repository: ${{ inputs.onnx_reports_repo }}
+          path: ${{ env.REPORTS_DIR }}
+          token: ${{ secrets.gh_token }}
+
+      - name: Copy ONNX results to repo - develop - nightly or manual
+        if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        run: |
+          ROOT=$(ls -dt ${{ env.TEST_RESULTS_PATH }}/onnx-* | head -1)
+          mkdir -p $GITHUB_WORKSPACE/${{ env.REPORTS_DIR }}/onnx_results/develop/${{ steps.git_sha.outputs.git_sha }}
+          cp -r ${ROOT}/. $GITHUB_WORKSPACE/${{ env.REPORTS_DIR }}/onnx_results/develop/${{ steps.git_sha.outputs.git_sha }}
+
+      - name: Copy ONNX results to repo - PRs
+        if: ${{ github.event_name != 'schedule' && github.event_name == 'pull_request_target' && github.event.action != 'closed' }}
+        shell: bash
+        run: |
+          ROOT=$(ls -dt ${{ env.TEST_RESULTS_PATH }}/onnx-* | head -1)
+          mkdir -p $GITHUB_WORKSPACE/${{ env.REPORTS_DIR }}/onnx_results/PRs/PR-$PR_ID/${{ steps.git_sha.outputs.git_sha }}
+          cp -r ${ROOT}/. $GITHUB_WORKSPACE/${{ env.REPORTS_DIR }}/onnx_results/PRs/PR-$PR_ID/${{ steps.git_sha.outputs.git_sha }}
+
+      - name: Push results to repo
+        continue-on-error: true
+        if: ${{ github.event.action != 'closed' }}
+        shell: bash
+        run: |
+          cd $GITHUB_WORKSPACE/${{ env.REPORTS_DIR }}/
+          git add .
+          git config --local user.email github-actions@github.com
+          git config --local user.name github-actions
+          git commit -m "ONNX results run https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" -a || true
+          git push || true
+
+      # --- sticky PR comment with summary
+      - name: Create ONNX comment on PR
+        if: ${{ github.event_name != 'schedule' && github.event_name == 'pull_request_target' && github.event.action != 'closed' }}
+        uses: marocchino/sticky-pull-request-comment@v2.9.0
+        with:
+          header: onnx
+          GITHUB_TOKEN: ${{ secrets.gh_token }}
+          path: ${{ env.TEST_RESULTS_PATH }}/$(ls -dt ${{ env.TEST_RESULTS_PATH }}/onnx-* | head -1 | xargs -I{} basename {})/summary.md
+          recreate: true
+
+      - name: Reset GPU parameters to default
+        if: ${{ github.event.action != 'closed' }}
+        run: sudo rocm-smi --device ${{ env.GPU }} --resetclocks
+
+      - name: Clean closed PR data
+        if: ${{ github.event.action == 'closed' }}
+        run: |
+          sudo rm -rf ${{ env.TEST_RESULTS_PATH }}
