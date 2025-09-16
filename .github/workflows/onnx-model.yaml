@@ -82,7 +82,7 @@ jobs:
             | jq -s '.[2].id' || true)
           docker stop onnx-test-$cancel_id || true
 
-      # ✅ Quick fix: map your runner name `gpu942f` to GPU=0 / CPU=0-63 (and keep originals)
+      # Map your runner names to GPU/CPU; default safely if unknown
       - name: Get runner ID
         shell: bash
         run: |
@@ -126,26 +126,48 @@ jobs:
         if: ${{ github.event.action != 'closed' }}
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-          ref: ${{ env.BRANCH_NAME }}
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
-          token: ${{ secrets.gh_token || github.token }}
+          ref:        ${{ github.head_ref || 'develop' }}
+          fetch-depth: 0
+          token:      ${{ secrets.gh_token }}
 
-      - name: Checkout utils (migraphx-benchmark-utils)
+      # --- utils checkout: manual clone with PAT and explicit branch ---
+      - name: Sanity-check PAT can see utils repo
         if: ${{ github.event.action != 'closed' }}
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ inputs.benchmark_utils_repo }}
-          path: ${{ env.UTILS_DIR }}
-          token: ${{ secrets.gh_token }}
+        shell: bash
+        run: |
+          set -e
+          code=$(curl -s -o /dev/null -w "%{http_code}\n" \
+            -H "Authorization: token ${{ secrets.gh_token }}" \
+            https://api.github.com/repos/${{ inputs.benchmark_utils_repo }})
+          echo "API status for ${{ inputs.benchmark_utils_repo }}: $code"
+
+      - name: Checkout utils (manual clone)
+        if: ${{ github.event.action != 'closed' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPO="${{ inputs.benchmark_utils_repo }}"     # e.g. danieyan-amd/migraphx-benchmark-utils
+          DEST="${{ env.UTILS_DIR }}"
+          rm -rf "$DEST"
+          # Pick branch explicitly to avoid default-branch API
+          for B in main master; do
+            if git ls-remote --heads "https://${{ secrets.gh_token }}@github.com/${REPO}.git" "$B" >/dev/null 2>&1; then
+              BRANCH="$B"; break
+            fi
+          done
+          : "${BRANCH:=main}"
+          echo "Cloning ${REPO} (branch: ${BRANCH}) into ${DEST}"
+          git clone --depth 1 --branch "$BRANCH" \
+            "https://${{ secrets.gh_token }}@github.com/${REPO}.git" "$DEST"
 
       - name: Calculate HASH
         if: ${{ github.event.action != 'closed' }}
         id: hash
         shell: bash
         run: |
-          cd $GITHUB_WORKSPACE
-          git checkout $BRANCH_NAME
+          cd "$GITHUB_WORKSPACE"
+          git checkout "$BRANCH_NAME"
           rocm_hash=$(echo ${{hashFiles('**/Dockerfile', '**/hip-clang.docker', '**/*requirements.txt', '**/requirements-py.txt', '**/install_prereqs.sh', '**/rbuild.ini')}} | cut -c 1-6)
           echo "HASH=$rocm_hash" >> $GITHUB_ENV
 
@@ -154,8 +176,8 @@ jobs:
         id: git_sha
         shell: bash
         run: |
-          cd $GITHUB_WORKSPACE
-          git checkout $BRANCH_NAME
+          cd "$GITHUB_WORKSPACE"
+          git checkout "$BRANCH_NAME"
           SHA=$(git log | head -5 | grep -m 1 "^commit" | awk '{print $2}' | cut -c 1-6)
           echo "git_sha=$SHA" >> $GITHUB_OUTPUT
 
@@ -183,7 +205,7 @@ jobs:
           TOKEN: ${{ secrets.gh_token }}
         shell: bash
         run: |
-          cd $GITHUB_WORKSPACE/${{ env.UTILS_DIR }}/scripts
+          cd "$GITHUB_WORKSPACE/${{ env.UTILS_DIR }}/scripts"
           ./build_migraphx_docker.sh ${{ inputs.benchmark_utils_repo }} ${{ github.event.pull_request.head.repo.full_name || github.repository }} ${{ env.BRANCH_NAME }}
 
       - name: Docker build (utils Daily.Dockerfile)
@@ -238,7 +260,7 @@ jobs:
             node --version
 
             if [ -f tools/model_zoo/test_generator/requirements.txt ]; then
-              grep -viE '^(torch|torchvision|torchaudio|onnxruntime-gpu)\\b' tools/model_zoo/test_generator/requirements.txt > .req_notorch.txt || true
+              grep -viE '^(torch|torchvision|torchaudio|onnxruntime-gpu)\b' tools/model_zoo/test_generator/requirements.txt > .req_notorch.txt || true
               pip3 install -r .req_notorch.txt
             fi
 
@@ -265,21 +287,18 @@ jobs:
 
             node - <<'JS'
             const fs=require('fs'),path=require('path');
-            const root=process.env.ROOT||process.argv[2]||process.env.PWD+'/data/test-results'.replace('/data/test-results','')+'/data/test-results'; // fallback not used but harmless
-            const runBase=process.env.RUN_TS?(`/data/test-results/onnx-${process.env.RUN_TS}`):null;
-            const dir=runBase||process.argv[2];
+            const rootDir = `/data/test-results/onnx-${process.env.RUN_TS}`;
             const precs=['fp32','fp16'];
             const summary={totals:{pass:0,fail:0},regressions:{}};
-            function looksFailed(t){return /(Traceback \\(most recent call last\\)|\\bERROR\\b|AssertionError|Segmentation fault|^error:)/im.test(t);}
+            function looksFailed(t){return /(Traceback \(most recent call last\)|\bERROR\b|AssertionError|Segmentation fault|^error:)/im.test(t);}
             function failureMessage(t){
-              const tb=[...t.matchAll(/Traceback \\(most recent call last\\):([\\s\\S]*?)(?:\\n\\s*\\n|\\Z)/g)];
-              if(tb.length){const block=tb[tb.length-1][1].trim().split(/\\r?\\n/).reverse();
+              const tb=[...t.matchAll(/Traceback \(most recent call last\):([\s\S]*?)(?:\n\s*\n|\Z)/g)];
+              if(tb.length){const block=tb[tb.length-1][1].trim().split(/\r?\n/).reverse();
                 for(const line of block) if(line.trim()) return line.trim();}
-              const lines=t.split(/\\r?\\n/).map(l=>l.trim()).filter(Boolean).reverse();
+              const lines=t.split(/\r?\n/).map(l=>l.trim()).filter(Boolean).reverse();
               for(const l of lines) if (/(error|exception|failed|segmentation fault|assert)/i.test(l)) return l;
               return 'failed (see log)';
             }
-            const rootDir = process.env.ROOT || process.env.RUN_TS ? `/data/test-results/onnx-${process.env.RUN_TS}` : dir;
             for(const prec of precs){
               const d=path.join(rootDir,prec); const reg={passed:[],failed:[]};
               if(fs.existsSync(d)&&fs.statSync(d).isDirectory()){
@@ -336,29 +355,31 @@ jobs:
         shell: bash
         run: |
           ROOT=$(ls -dt ${{ env.TEST_RESULTS_PATH }}/onnx-* | head -1)
-          mkdir -p $GITHUB_WORKSPACE/${{ env.REPORTS_DIR }}/onnx_results/develop/${{ steps.git_sha.outputs.git_sha }}
-          cp -r ${ROOT}/. $GITHUB_WORKSPACE/${{ env.REPORTS_DIR }}/onnx_results/develop/${{ steps.git_sha.outputs.git_sha }}
+          mkdir -p "$GITHUB_WORKSPACE/${{ env.REPORTS_DIR }}/onnx_results/develop/${{ steps.git_sha.outputs.git_sha }}"
+          cp -r "${ROOT}/." "$GITHUB_WORKSPACE/${{ env.REPORTS_DIR }}/onnx_results/develop/${{ steps.git_sha.outputs.git_sha }}"
 
       - name: Copy ONNX results to repo - PRs
         if: ${{ github.event_name != 'schedule' && github.event_name == 'pull_request_target' && github.event.action != 'closed' }}
         shell: bash
         run: |
           ROOT=$(ls -dt ${{ env.TEST_RESULTS_PATH }}/onnx-* | head -1)
-          mkdir -p $GITHUB_WORKSPACE/${{ env.REPORTS_DIR }}/onnx_results/PRs/PR-$PR_ID/${{ steps.git_sha.outputs.git_sha }}
-          cp -r ${ROOT}/. $GITHUB_WORKSPACE/${{ env.REPORTS_DIR }}/onnx_results/PRs/PR-$PR_ID/${{ steps.git_sha.outputs.git_sha }}
+          mkdir -p "$GITHUB_WORKSPACE/${{ env.REPORTS_DIR }}/onnx_results/PRs/PR-$PR_ID/${{ steps.git_sha.outputs.git_sha }}"
+          cp -r "${ROOT}/." "$GITHUB_WORKSPACE/${{ env.REPORTS_DIR }}/onnx_results/PRs/PR-$PR_ID/${{ steps.git_sha.outputs.git_sha }}"
 
       - name: Push results to repo
         continue-on-error: true
         if: ${{ github.event.action != 'closed' }}
         shell: bash
         run: |
-          cd $GITHUB_WORKSPACE/${{ env.REPORTS_DIR }}/
+          cd "$GITHUB_WORKSPACE/${{ env.REPORTS_DIR }}/"
           git add .
           git config --local user.email github-actions@github.com
           git config --local user.name github-actions
           git commit -m "ONNX results run https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" -a || true
           git push || true
 
+      # NOTE: this 'path:' expects a literal path; if it fails later,
+      # we can compute the exact file path into an env var in a prior step.
       - name: Create ONNX comment on PR
         if: ${{ github.event_name != 'schedule' && github.event_name == 'pull_request_target' && github.event.action != 'closed' }}
         uses: marocchino/sticky-pull-request-comment@v2.9.0
