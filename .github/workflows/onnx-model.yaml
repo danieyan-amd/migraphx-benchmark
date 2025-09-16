@@ -178,8 +178,10 @@ jobs:
         run: |
           cd "$GITHUB_WORKSPACE"
           git checkout "$BRANCH_NAME"
-          SHA=$(git log | head -5 | grep -m 1 "^commit" | awk '{print $2}' | cut -c 1-6)
-          echo "git_sha=$SHA" >> $GITHUB_OUTPUT
+          # Short 6-char commit id without using head/grep pipelines
+          SHA="$(git rev-parse --short=6 HEAD)"
+          echo "git_sha=$SHA" >> "$GITHUB_OUTPUT"
+
 
       - name: Check image hash
         if: ${{ github.event.action != 'closed' }}
