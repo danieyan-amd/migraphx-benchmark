@@ -176,22 +176,34 @@ jobs:
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
-          rocm_hash=$(
-            echo \
-              dockerfiles/Base.Dockerfile \
-              dockerfiles/Daily.Dockerfile \
-              **/install_prereqs.sh \
-              **/rbuild.ini \
-              **/*requirements.txt \
-              **/requirements-py.txt \
-            | tr ' ' '\n' \
-            | sort -u \
-            | xargs -I{} bash -c 'test -f "{}" && printf "{}\0"' \
-            | xargs -0 sha256sum \
-            | sha256sum \
-            | cut -c1-6
+
+          # Collect candidate files (Dockerfiles, prereqs, requirements, rbuild.ini)
+          mapfile -d '' FILES < <(
+            find . -type f \( \
+              -path './dockerfiles/Base.Dockerfile' -o \
+              -path './dockerfiles/Daily.Dockerfile' -o \
+              -name 'install_prereqs.sh'         -o \
+              -name 'rbuild.ini'                  -o \
+              -name '*requirements.txt'           -o \
+              -name 'requirements-py.txt' \
+            \) -print0 2>/dev/null || true
           )
-          echo "HASH=$rocm_hash" >> "$GITHUB_ENV"
+
+          if (( ${#FILES[@]} > 0 )); then
+            # Stable order + hash of hashes → short tag
+            rocm_hash="$(printf '%s\0' "${FILES[@]}" \
+              | sort -z \
+              | xargs -0 sha256sum \
+              | sha256sum \
+              | cut -c1-6)"
+          else
+            # Fallback when none of the files exist in this branch/PR
+            rocm_hash="$(git rev-parse --short=6 HEAD)"
+            echo "No docker/requirements/prereqs files found; falling back to git SHA: ${rocm_hash}"
+          fi
+
+          echo "HASH=${rocm_hash}" >> "$GITHUB_ENV"
+
 
       - name: Get git SHA
         if: ${{ github.event.action != 'closed' }}
