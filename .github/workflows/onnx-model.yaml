@@ -21,6 +21,15 @@ on:
       model_timeout:
         type: string
         required: true
+      # optional knobs
+      force_rebuild_base:
+        type: boolean
+        required: false
+        default: false
+      use_docker:
+        type: boolean
+        required: false
+        default: true
     secrets:
       gh_token:
         required: true
@@ -82,7 +91,7 @@ jobs:
             | jq -s '.[2].id' || true)
           docker stop onnx-test-$cancel_id || true
 
-      # Map your runner names to GPU/CPU; default safely if unknown
+      # Map runner names → GPU/CPU masks (includes your gpu942f)
       - name: Get runner ID
         shell: bash
         run: |
@@ -126,40 +135,38 @@ jobs:
         if: ${{ github.event.action != 'closed' }}
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
-          ref:        ${{ github.head_ref || 'develop' }}
           fetch-depth: 0
-          token:      ${{ secrets.gh_token }}
+          ref: ${{ env.BRANCH_NAME }}
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          token: ${{ secrets.gh_token || github.token }}
 
-      # --- utils checkout: manual clone with PAT and explicit branch ---
+      # Confirm the PAT can see the utils repo (quick sanity)
       - name: Sanity-check PAT can see utils repo
-        if: ${{ github.event.action != 'closed' }}
         shell: bash
         run: |
-          set -e
           code=$(curl -s -o /dev/null -w "%{http_code}\n" \
             -H "Authorization: token ${{ secrets.gh_token }}" \
             https://api.github.com/repos/${{ inputs.benchmark_utils_repo }})
           echo "API status for ${{ inputs.benchmark_utils_repo }}: $code"
+          [ "$code" = "200" ] || { echo "Token cannot read repo (code=$code)"; exit 1; }
 
       - name: Checkout utils (manual clone)
         if: ${{ github.event.action != 'closed' }}
         shell: bash
         run: |
           set -euo pipefail
-          REPO="${{ inputs.benchmark_utils_repo }}"     # e.g. danieyan-amd/migraphx-benchmark-utils
+          REPO="${{ inputs.benchmark_utils_repo }}"
           DEST="${{ env.UTILS_DIR }}"
           rm -rf "$DEST"
-          # Pick branch explicitly to avoid default-branch API
           for B in main master; do
-            if git ls-remote --heads "https://${{ secrets.gh_token }}@github.com/${REPO}.git" "$B" >/dev/null 2>&1; then
+            if git ls-remote --heads "https://x-access-token:${{ secrets.gh_token }}@github.com/${REPO}.git" "$B" >/dev/null 2>&1; then
               BRANCH="$B"; break
             fi
           done
           : "${BRANCH:=main}"
           echo "Cloning ${REPO} (branch: ${BRANCH}) into ${DEST}"
           git clone --depth 1 --branch "$BRANCH" \
-            "https://${{ secrets.gh_token }}@github.com/${REPO}.git" "$DEST"
+            "https://x-access-token:${{ secrets.gh_token }}@github.com/${REPO}.git" "$DEST"
 
       - name: Calculate HASH
         if: ${{ github.event.action != 'closed' }}
@@ -168,7 +175,21 @@ jobs:
         run: |
           cd "$GITHUB_WORKSPACE"
           git checkout "$BRANCH_NAME"
-          rocm_hash=$(echo ${{hashFiles('**/Dockerfile', '**/hip-clang.docker', '**/*requirements.txt', '**/requirements-py.txt', '**/install_prereqs.sh', '**/rbuild.ini')}} | cut -c 1-6)
+          rocm_hash=$(
+            echo \
+              dockerfiles/Base.Dockerfile \
+              dockerfiles/Daily.Dockerfile \
+              **/install_prereqs.sh \
+              **/rbuild.ini \
+              **/*requirements.txt \
+              **/requirements-py.txt \
+            | tr ' ' '\n' \
+            | sort -u \
+            | xargs -I{} bash -c 'test -f "{}" && printf "{}\0"' \
+            | xargs -0 sha256sum \
+            | sha256sum \
+            | cut -c1-6
+          )
           echo "HASH=$rocm_hash" >> $GITHUB_ENV
 
       - name: Get git SHA
@@ -178,28 +199,31 @@ jobs:
         run: |
           cd "$GITHUB_WORKSPACE"
           git checkout "$BRANCH_NAME"
-          # Short 6-char commit id without using head/grep pipelines
           SHA="$(git rev-parse --short=6 HEAD)"
           echo "git_sha=$SHA" >> "$GITHUB_OUTPUT"
-
 
       - name: Check image hash
         if: ${{ github.event.action != 'closed' }}
         id: check_hash
         shell: bash
         run: |
-          echo ${{ env.HASH }}
           echo "DOCKERBASE=rocm-migraphx:${{ inputs.rocm_release }}-${{ env.HASH }}" >> $GITHUB_ENV
           if [ -z "$(docker images -q rocm-migraphx:${{ inputs.rocm_release }}-${{ env.HASH }})" ]; then
-            echo "Hashes not match, base ROCm image will be rebuilt"
-            echo "image=true" >> $GITHUB_ENV
-          else 
-            echo "Hashes match, continue with existing image"
+            # on PRs, don't force rebuild unless input says so
+            if [[ "${{ github.event_name }}" == "pull_request_target" && "${{ inputs.force_rebuild_base }}" != "true" ]]; then
+              echo "image=false" >> $GITHUB_ENV
+              echo "Base missing, but skipping rebuild on PR."
+            else
+              echo "image=true" >> $GITHUB_ENV
+              echo "Base will be rebuilt."
+            fi
+          else
             echo "image=false" >> $GITHUB_ENV
+            echo "Base image already present."
           fi
 
       - name: Rebuild ROCm base (utils script)
-        if: ${{ env.image == 'true' }}
+        if: ${{ env.image == 'true' && inputs.force_rebuild_base && inputs.use_docker }}
         env:
           ROCM_RELEASE: ${{ inputs.rocm_release }}
           DOCKERIMAGE: rocm-migraphx:${{ inputs.rocm_release }}-${{ env.HASH }}
@@ -211,7 +235,7 @@ jobs:
           ./build_migraphx_docker.sh ${{ inputs.benchmark_utils_repo }} ${{ github.event.pull_request.head.repo.full_name || github.repository }} ${{ env.BRANCH_NAME }}
 
       - name: Docker build (utils Daily.Dockerfile)
-        if: ${{ github.event.action != 'closed' }}
+        if: ${{ github.event.action != 'closed' && inputs.use_docker }}
         shell: bash
         run: >
           cd $GITHUB_WORKSPACE/${{ env.UTILS_DIR }} && docker build
@@ -222,8 +246,8 @@ jobs:
           -t "migraphx-rocm:${{ inputs.rocm_release }}-${{ steps.git_sha.outputs.git_sha }}"
           -f dockerfiles/Daily.Dockerfile .
 
-      - name: Run ONNX model-zoo
-        if: ${{ github.event.action != 'closed' }}
+      - name: Run ONNX model-zoo (docker)
+        if: ${{ github.event.action != 'closed' && inputs.use_docker }}
         shell: bash
         env:
           GPU: ${{ env.GPU }}
@@ -270,7 +294,6 @@ jobs:
             chmod +x ./run-model-zoo-tests.js || true
 
             RUN_TS=$(date -u +%Y%m%dT%H%M%SZ)
-            echo \"RUN_TS=$RUN_TS\"
             ROOT=\"/data/test-results/onnx-${RUN_TS}\"
             mkdir -p \"${ROOT}/fp16\" \"${ROOT}/fp32\"
             echo \"${RUN_TS}\" > \"${ROOT}/run.timestamp\"
@@ -287,17 +310,21 @@ jobs:
               [ -d \"$src\" ] && cp -f \"$src\"/*.log \"${ROOT}/$p/\" || true
             done
 
-            node - <<'JS'
+            # ---- JS summary in a temp file (avoids heredoc indentation issues) ----
+            cat >/tmp/onnx_summarize.js <<'JS'
             const fs=require('fs'),path=require('path');
-            const rootDir = `/data/test-results/onnx-${process.env.RUN_TS}`;
+            const runTs=process.env.RUN_TS||process.argv[2];
+            const rootDir=`/data/test-results/onnx-${runTs}`;
             const precs=['fp32','fp16'];
             const summary={totals:{pass:0,fail:0},regressions:{}};
-            function looksFailed(t){return /(Traceback \(most recent call last\)|\bERROR\b|AssertionError|Segmentation fault|^error:)/im.test(t);}
+            function looksFailed(t){return /(Traceback \\(most recent call last\\)|\\bERROR\\b|AssertionError|Segmentation fault|^error:)/im.test(t);}
             function failureMessage(t){
-              const tb=[...t.matchAll(/Traceback \(most recent call last\):([\s\S]*?)(?:\n\s*\n|\Z)/g)];
-              if(tb.length){const block=tb[tb.length-1][1].trim().split(/\r?\n/).reverse();
-                for(const line of block) if(line.trim()) return line.trim();}
-              const lines=t.split(/\r?\n/).map(l=>l.trim()).filter(Boolean).reverse();
+              const tb=[...t.matchAll(/Traceback \\(most recent call last\\):([\\s\\S]*?)(?:\\n\\s*\\n|\\Z)/g)];
+              if(tb.length){
+                const block=tb[tb.length-1][1].trim().split(/\\r?\\n/).reverse();
+                for(const line of block) if(line.trim()) return line.trim();
+              }
+              const lines=t.split(/\\r?\\n/).map(l=>l.trim()).filter(Boolean).reverse();
               for(const l of lines) if (/(error|exception|failed|segmentation fault|assert)/i.test(l)) return l;
               return 'failed (see log)';
             }
@@ -329,7 +356,78 @@ jobs:
             }
             fs.writeFileSync(path.join(rootDir,'summary.md'), lines.join('\\n'));
             JS
+
+            node /tmp/onnx_summarize.js \"${RUN_TS}\"
           "
+
+      # (optional) non-docker path if you flip use_docker=false
+      - name: Run ONNX model-zoo (no docker)
+        if: ${{ github.event.action != 'closed' && !inputs.use_docker }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v node >/dev/null 2>&1; then
+            sudo apt-get update -y
+            curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+            sudo apt-get install -y nodejs
+          fi
+          pip3 install -r tools/model_zoo/test_generator/requirements.txt
+          RUN_TS=$(date -u +%Y%m%dT%H%M%SZ)
+          ROOT="${TEST_RESULTS_PATH}/onnx-${RUN_TS}"
+          mkdir -p "${ROOT}/fp16" "${ROOT}/fp32"
+          node ./run-model-zoo-tests.js --datasets /usr/share/migraphx/saved-models --out tools/model_zoo/onnx_zoo
+          bash tools/model_zoo/test_generator/test_models.sh tools/model_zoo/onnx_zoo 2>&1 | tee "${ROOT}/raw.log"
+          # copy logs & summarize same as docker block above...
+          for p in fp16 fp32; do
+            src="tools/model_zoo/test_generator/logs/$p"
+            [ -d "$src" ] && cp -f "$src"/*.log "${ROOT}/$p/" || true
+          done
+          cat >/tmp/onnx_summarize.js <<'JS'
+          const fs=require('fs'),path=require('path');
+          const runTs=process.env.RUN_TS||process.argv[2];
+          const rootDir=process.env.ROOT||`${process.env.TEST_RESULTS_PATH||'/data/test-results'}/onnx-${runTs}`;
+          const precs=['fp32','fp16'];
+          const summary={totals:{pass:0,fail:0},regressions:{}};
+          function looksFailed(t){return /(Traceback \(most recent call last\)|\bERROR\b|AssertionError|Segmentation fault|^error:)/im.test(t);}
+          function failureMessage(t){
+            const tb=[...t.matchAll(/Traceback \(most recent call last\):([\s\S]*?)(?:\n\s*\n|\Z)/g)];
+            if(tb.length){
+              const block=tb[tb.length-1][1].trim().split(/\r?\n/).reverse();
+              for(const line of block) if(line.trim()) return line.trim();
+            }
+            const lines=t.split(/\r?\n/).map(l=>l.trim()).filter(Boolean).reverse();
+            for(const l of lines) if (/(error|exception|failed|segmentation fault|assert)/i.test(l)) return l;
+            return 'failed (see log)';
+          }
+          for(const prec of precs){
+            const d=path.join(rootDir,prec); const reg={passed:[],failed:[]};
+            if(fs.existsSync(d)&&fs.statSync(d).isDirectory()){
+              const files=fs.readdirSync(d).filter(f=>f.endsWith('.log')).sort();
+              for(const fn of files){
+                const model=fn.slice(0,-4);
+                const txt=fs.readFileSync(path.join(d,fn),'utf8');
+                if(looksFailed(txt)){reg.failed.push({model,message:failureMessage(txt)});summary.totals.fail++;}
+                else {reg.passed.push(model);summary.totals.pass++;}
+              }
+            }
+            summary.regressions[prec]=reg;
+          }
+          fs.writeFileSync(path.join(rootDir,'summary.json'), JSON.stringify(summary,null,2));
+          const lines=[];
+          lines.push('## Totals',`- PASS: ${summary.totals.pass}`,`- FAIL: ${summary.totals.fail}`,'');
+          for(const prec of precs){
+            const reg=summary.regressions[prec];
+            lines.push(`## ${prec.toUpperCase()}`);
+            lines.push(`**Passed (${reg.passed.length})**`);
+            if(reg.passed.length) reg.passed.forEach(m=>lines.push(`- ${m}`)); else lines.push('- none');
+            lines.push('');
+            lines.push(`**Failed (${reg.failed.length})**`);
+            if(reg.failed.length) reg.failed.forEach(it=>lines.push(`- ${it.model}: \`${it.message}\``)); else lines.push('- none');
+            lines.push('');
+          }
+          fs.writeFileSync(path.join(rootDir,'summary.md'), lines.join('\n'));
+          JS
+          node /tmp/onnx_summarize.js "${RUN_TS}"
 
       - name: Delete old images/containers
         if: ${{ github.event_name == 'schedule' }}
@@ -380,8 +478,6 @@ jobs:
           git commit -m "ONNX results run https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" -a || true
           git push || true
 
-      # NOTE: this 'path:' expects a literal path; if it fails later,
-      # we can compute the exact file path into an env var in a prior step.
       - name: Create ONNX comment on PR
         if: ${{ github.event_name != 'schedule' && github.event_name == 'pull_request_target' && github.event.action != 'closed' }}
         uses: marocchino/sticky-pull-request-comment@v2.9.0
