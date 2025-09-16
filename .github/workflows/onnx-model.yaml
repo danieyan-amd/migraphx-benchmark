@@ -168,13 +168,14 @@ jobs:
           git clone --depth 1 --branch "$BRANCH" \
             "https://x-access-token:${{ secrets.gh_token }}@github.com/${REPO}.git" "$DEST"
 
+      # ---------- SAFE versions (no branch switching) ----------
       - name: Calculate HASH
         if: ${{ github.event.action != 'closed' }}
         id: hash
         shell: bash
         run: |
+          set -euo pipefail
           cd "$GITHUB_WORKSPACE"
-          git checkout "$BRANCH_NAME"
           rocm_hash=$(
             echo \
               dockerfiles/Base.Dockerfile \
@@ -190,17 +191,18 @@ jobs:
             | sha256sum \
             | cut -c1-6
           )
-          echo "HASH=$rocm_hash" >> $GITHUB_ENV
+          echo "HASH=$rocm_hash" >> "$GITHUB_ENV"
 
       - name: Get git SHA
         if: ${{ github.event.action != 'closed' }}
         id: git_sha
         shell: bash
         run: |
+          set -euo pipefail
           cd "$GITHUB_WORKSPACE"
-          git checkout "$BRANCH_NAME"
           SHA="$(git rev-parse --short=6 HEAD)"
           echo "git_sha=$SHA" >> "$GITHUB_OUTPUT"
+      # ---------------------------------------------------------
 
       - name: Check image hash
         if: ${{ github.event.action != 'closed' }}
@@ -310,7 +312,7 @@ jobs:
               [ -d \"$src\" ] && cp -f \"$src\"/*.log \"${ROOT}/$p/\" || true
             done
 
-            # ---- JS summary in a temp file (avoids heredoc indentation issues) ----
+            # ---- JS summary in a temp file (avoids heredoc issues) ----
             cat >/tmp/onnx_summarize.js <<'JS'
             const fs=require('fs'),path=require('path');
             const runTs=process.env.RUN_TS||process.argv[2];
@@ -377,7 +379,6 @@ jobs:
           mkdir -p "${ROOT}/fp16" "${ROOT}/fp32"
           node ./run-model-zoo-tests.js --datasets /usr/share/migraphx/saved-models --out tools/model_zoo/onnx_zoo
           bash tools/model_zoo/test_generator/test_models.sh tools/model_zoo/onnx_zoo 2>&1 | tee "${ROOT}/raw.log"
-          # copy logs & summarize same as docker block above...
           for p in fp16 fp32; do
             src="tools/model_zoo/test_generator/logs/$p"
             [ -d "$src" ] && cp -f "$src"/*.log "${ROOT}/$p/" || true
