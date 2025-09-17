@@ -1,26 +1,38 @@
-name: ONNX Model Zoo Tests (Docker-light)
+name: ONNX Model Zoo Tests
 
 on:
   workflow_call:
     inputs:
-      rocm_release:        { type: string, required: true }
-      onnx_reports_repo:   { type: string, required: true }
-      benchmark_utils_repo:{ type: string, required: true }
-      organization:        { type: string, required: true }
-      result_number:       { type: string, required: true }
-      model_timeout:       { type: string, required: true }
+      rocm_release:
+        type: string
+        required: true
+      onnx_reports_repo:
+        type: string
+        required: true
+      benchmark_utils_repo:
+        type: string
+        required: true
+      organization:
+        type: string
+        required: true
+      result_number:
+        type: string
+        required: true
+      model_timeout:
+        type: string
+        required: true
     secrets:
-      gh_token: { required: true }
+      gh_token:
+        required: true
 
 permissions:
   contents: read
 
 env:
-  DATASETS_DIR: /usr/share/migraphx/migraph_datasets
-  LOG_ROOT: logs
+  # Container base (simple, has PyTorch+Python)
   DOCKER_IMAGE: rocm/pytorch:latest
-  PYTHONPATH: /opt/rocm/lib
-  LD_LIBRARY_PATH: /opt/rocm/lib
+  # Typical dataset locations (mounted read-only)
+  DATASETS_DIR: /usr/share/migraphx/migraph_datasets
 
 jobs:
   model-zoo-tests:
@@ -38,7 +50,6 @@ jobs:
         shell: bash
         run: echo "stamp=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
 
-      # (Host) Sanity: show what’s under the usual dataset roots
       - name: List datasets on host (debug)
         shell: bash
         run: |
@@ -51,7 +62,6 @@ jobs:
             echo "==> Host path: $d"
             if [ -d "$d" ]; then
               echo "    exists"
-              # Count a few candidate files
               cnt=$(find "$d" -type f \( -name '*.onnx' -o -name '*.pb' \) | head -100 | wc -l)
               echo "    sample model files found: $cnt"
             else
@@ -59,7 +69,7 @@ jobs:
             fi
           done
 
-      - name: Run ONNX Model Zoo in container
+      - name: Run ONNX model-zoo inside container
         shell: bash
         env:
           RUN_TS: ${{ steps.ts.outputs.stamp }}
@@ -73,23 +83,23 @@ jobs:
             -e TARGET=gpu \
             -e ATOL=0.001 -e RTOL=0.001 \
             -e RUN_TS="${RUN_TS}" \
-            -e PYTHONPATH=${PYTHONPATH} \
-            -e LD_LIBRARY_PATH=${LD_LIBRARY_PATH} \
+            -e PYTHONPATH=/opt/rocm/lib \
+            -e LD_LIBRARY_PATH=/opt/rocm/lib \
             -v /opt/rocm:/opt/rocm:ro \
-            -v "/usr/share/migraphx/migraph_datasets":/datasets:ro \
+            -v /usr/share/migraphx/migraph_datasets:/datasets:ro \
             -v /usr/share/migraphx/saved-models:/saved-models:ro \
             -v /usr/share/migraphx/new-saved-models:/new-saved-models:ro \
             -v "$GITHUB_WORKSPACE":/workspace \
             -w /workspace \
-            "${{ env.DOCKER_IMAGE }}" \
+            "${DOCKER_IMAGE}" \
             bash -lc '
               set -euo pipefail
 
               echo "Checking dataset candidates inside container..."
               for d in /datasets /saved-models /new-saved-models; do
                 if [ -d "$d" ]; then
-                  c=$(find "$d" -type f \( -name "*.onnx" -o -name "*.pb" \) | head -100 | wc -l)
-                  printf "  %s: %s (sample files: %s)\n" "$d" "present" "$c"
+                  c=$(find "$d" -type f \( -name "*.onnx" -o -name "*.pb" \) | head -100 | wc -l || true)
+                  printf "  %s: present (sample files: %s)\n" "$d" "$c"
                 else
                   printf "  %s: missing\n" "$d"
                 fi
@@ -105,7 +115,7 @@ jobs:
               done
 
               if [ -z "${DATASET_ROOT:-}" ]; then
-                echo "ERROR: No model files found under /datasets, /saved-models, or /new-saved-models."
+                echo "ERROR: No .onnx/.pb files under /datasets, /saved-models, or /new-saved-models."
                 exit 1
               fi
               echo "Using DATASET_ROOT=$DATASET_ROOT"
@@ -121,10 +131,12 @@ jobs:
               fi
               node --version
 
-              # Install test-only deps (skip torch/onnxruntime to avoid clashes with base)
+              # Install test-only deps (skip torch/onnxruntime to avoid clashing with base)
               if [ -f tools/model_zoo/test_generator/requirements.txt ]; then
                 grep -viE "^(torch|torchvision|torchaudio|onnxruntime(-gpu)?)\\b" tools/model_zoo/test_generator/requirements.txt > .req_notorch.txt || true
-                pip3 install -r .req_notorch.txt
+                if [ -s .req_notorch.txt ]; then
+                  pip3 install -r .req_notorch.txt
+                fi
               fi
 
               chmod +x tools/model_zoo/test_generator/test_models.sh || true
@@ -148,7 +160,7 @@ jobs:
                 [ -d "$src" ] && cp -f "$src"/*.log "${ROOT}/$p/" || true
               done
 
-              # ---- Write JS to a temp file and run it (avoids nested-quote errors) ----
+              # Write summarizer to a temp file (avoids nested-quote issues)
               cat >/tmp/onnx_summarize.js <<'"'"'JS'"'"'
               const fs = require("fs");
               const path = require("path");
