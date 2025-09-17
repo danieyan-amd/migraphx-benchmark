@@ -55,6 +55,8 @@ jobs:
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
+        with:
+          clean: false  # avoid failing if prior root-owned files exist
 
       - name: Init timestamp
         id: ts
@@ -245,10 +247,15 @@ jobs:
             
             -v "${{ steps.results.outputs.host_results }}":/results \
             -v "$GITHUB_WORKSPACE":/workspace \
+            --user "$(id -u):$(id -g)" \
+            
             -v /tmp/in_container.sh:/in_container.sh:ro \
             -w /workspace \
             "${DOCKER_IMAGE}" \
             bash /in_container.sh
+
+          # Ensure repo tree is cleanable by checkout next runs
+          rm -rf tools/model_zoo/test_generator/logs/* || true
 
       - name: Upload logs and summary (timestamped)
         uses: actions/upload-artifact@v4
