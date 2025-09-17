@@ -1,36 +1,51 @@
-name: ONNX Model Zoo Tests
+name: MIGraphX ONNX Model Tests (reusable, thin PyTorch image)
 
 on:
   workflow_call:
     inputs:
       rocm_release:
+        description: ROCm Version (for parity with caller; not used by image)
         type: string
         required: true
       onnx_reports_repo:
+        description: Repository where ONNX reports are stored (optional use downstream)
         type: string
         required: true
       benchmark_utils_repo:
+        description: Repo for utils (accepted for parity; not used here)
         type: string
         required: true
       organization:
+        description: Organization (used for paths if needed)
         type: string
         required: true
       result_number:
+        description: Last N results (accepted for parity)
         type: string
         required: true
       model_timeout:
+        description: Per-model timeout (accepted for parity)
         type: string
         required: true
     secrets:
       gh_token:
-        required: true
+        description: GitHub token (optional; used when checking out reports repo)
+        required: false
 
 permissions:
   contents: read
 
 env:
-  DOCKER_IMAGE: rocm/pytorch:latest
   DATASETS_DIR: /usr/share/migraphx/migraph_datasets
+  LOG_ROOT: logs
+
+  # Image knob — we stick to a thin public ROCm PyTorch image
+  PT_TAG: latest
+  DOCKER_IMAGE: rocm/pytorch:latest
+
+  # Keep these in env so container inherits
+  PYTHONPATH: /opt/rocm/lib
+  LD_LIBRARY_PATH: /opt/rocm/lib
 
 jobs:
   model-zoo-tests:
@@ -38,29 +53,25 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      # --- NEW: clean any root-owned leftovers BEFORE checkout tries to clean ---
-      - name: Pre-clean workspace (logs & test logs)
-        shell: bash
-        run: |
-          set -euo pipefail
-          # These may exist from a prior run (root-owned)
-          sudo rm -rf "$GITHUB_WORKSPACE/logs" || true
-          sudo rm -rf "$GITHUB_WORKSPACE/tools/model_zoo/test_generator/logs" || true
-          # Ensure repo dir is all owned by runner
-          sudo chown -R "$(id -u)":"$(id -g)" "$GITHUB_WORKSPACE" || true
-
       - name: Checkout sources
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.gh_token }}
-          # clean:true is fine now that we fixed ownership above
-          clean: true
-          fetch-depth: 0
 
       - name: Init timestamp
         id: ts
-        shell: bash
         run: echo "stamp=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Choose results directory
+        id: results
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUN_TS="${{ steps.ts.outputs.stamp }}"
+          # Store results OUTSIDE the repo to avoid permission/cleanup issues
+          RES_DIR="${RUNNER_TEMP}/onnx-${RUN_TS}"
+          mkdir -p "$RES_DIR/fp16" "$RES_DIR/fp32"
+          echo "run_ts=$RUN_TS" >> "$GITHUB_OUTPUT"
+          echo "host_results=$RES_DIR" >> "$GITHUB_OUTPUT"
+          echo "Using $RES_DIR for artifacts"
 
       - name: List datasets on host (debug)
         shell: bash
@@ -73,70 +84,49 @@ jobs:
           do
             echo "==> Host path: $d"
             if [ -d "$d" ]; then
-              echo "    exists"
-              cnt=$(find "$d" -type f \( -name '*.onnx' -o -name '*.pb' \) | head -100 | wc -l)
-              echo "    sample model files found: $cnt"
+              if find "$d" -type f \( -name '*.onnx' -o -name '*.pb' \) -print -quit | grep -q . ; then
+                echo "    contains model files"
+              else
+                echo "    (no .onnx/.pb files found)"
+              fi
             else
               echo "    (missing)"
             fi
           done
 
-      - name: Run ONNX model-zoo inside container (as runner user)
-        shell: bash
+      - name: Run Model Zoo tests in container
         env:
-          RUN_TS: ${{ steps.ts.outputs.stamp }}
+          RUN_TS: ${{ steps.results.outputs.run_ts }}
+        shell: bash
         run: |
           set -euo pipefail
 
-          # Ensure our log dirs exist and are owned by runner
-          mkdir -p "$GITHUB_WORKSPACE/logs/${RUN_TS}"/{fp16,fp32}
-          chmod -R u+rwX "$GITHUB_WORKSPACE/logs" || true
+          if [ ! -d "${DATASETS_DIR}" ]; then
+            echo "Datasets dir not found on host: ${DATASETS_DIR}"
+            exit 1
+          fi
 
           docker run --rm \
             --name model-zoo-${GITHUB_RUN_ID} \
-            --user "$(id -u)":"$(id -g)" \
             --device=/dev/kfd --device=/dev/dri --group-add=video \
             --network=host \
             -e TARGET=gpu \
             -e ATOL=0.001 -e RTOL=0.001 \
             -e RUN_TS="${RUN_TS}" \
-            -e PYTHONPATH=/opt/rocm/lib \
-            -e LD_LIBRARY_PATH=/opt/rocm/lib \
+            -e PYTHONPATH=${PYTHONPATH} \
+            -e LD_LIBRARY_PATH=${LD_LIBRARY_PATH} \
             -v /opt/rocm:/opt/rocm:ro \
-            -v /usr/share/migraphx/migraph_datasets:/datasets:ro \
-            -v /usr/share/migraphx/saved-models:/saved-models:ro \
-            -v /usr/share/migraphx/new-saved-models:/new-saved-models:ro \
+            -v "${DATASETS_DIR}":/datasets:ro \
+            -v "${{ steps.results.outputs.host_results }}":/results \
             -v "$GITHUB_WORKSPACE":/workspace \
             -w /workspace \
             "${DOCKER_IMAGE}" \
             bash -lc '
               set -euo pipefail
 
-              echo "Checking dataset candidates inside container..."
-              for d in /datasets /saved-models /new-saved-models; do
-                if [ -d "$d" ]; then
-                  c=$(find "$d" -type f \( -name "*.onnx" -o -name "*.pb" \) | head -100 | wc -l || true)
-                  printf "  %s: present (sample files: %s)\n" "$d" "$c"
-                else
-                  printf "  %s: missing\n" "$d"
-                fi
-              done
+              echo "Datasets at /datasets"
 
-              # Pick a dataset root that actually has model files
-              DATASET_ROOT=""
-              for cand in /datasets /saved-models /new-saved-models; do
-                if [ -d "$cand" ] && find "$cand" -type f \( -name "*.onnx" -o -name "*.pb" \) | head -1 | grep -q .; then
-                  DATASET_ROOT="$cand"
-                  break
-                fi
-              done
-              if [ -z "${DATASET_ROOT:-}" ]; then
-                echo "ERROR: No .onnx/.pb files under /datasets, /saved-models, or /new-saved-models."
-                exit 1
-              fi
-              echo "Using DATASET_ROOT=$DATASET_ROOT"
-
-              # Install Node.js 20 for the JS generator (if missing)
+              # ---- Node.js for the JS generator ----
               if ! command -v node >/dev/null 2>&1; then
                 apt-get update -y
                 apt-get install -y --no-install-recommends ca-certificates curl gnupg
@@ -145,95 +135,103 @@ jobs:
                 echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
                 apt-get update -y && apt-get install -y --no-install-recommends nodejs
               fi
-              node --version
 
-              # Install test-only deps (skip torch/onnxruntime to avoid clashing with base)
+              # ---- Install test-only deps (avoid torch/ort conflicts) ----
               if [ -f tools/model_zoo/test_generator/requirements.txt ]; then
                 grep -viE "^(torch|torchvision|torchaudio|onnxruntime(-gpu)?)\\b" tools/model_zoo/test_generator/requirements.txt > .req_notorch.txt || true
-                if [ -s .req_notorch.txt ]; then
-                  pip3 install -r .req_notorch.txt
-                fi
+                pip3 install -r .req_notorch.txt
               fi
 
               chmod +x tools/model_zoo/test_generator/test_models.sh || true
               chmod +x ./run-model-zoo-tests.js || true
 
-              ROOT="logs/${RUN_TS}"
-              mkdir -p "${ROOT}/fp16" "${ROOT}/fp32"
+              # Be explicit about dataset root picked
+              echo "Checking dataset candidates inside container..."
+              for d in /datasets /saved-models /new-saved-models; do
+                if [ -d "$d" ]; then
+                  if find "$d" -type f \( -name "*.onnx" -o -name "*.pb" \) -print -quit | grep -q . ; then
+                    printf "  %s: present (has model files)\n" "$d"
+                  else
+                    printf "  %s: present (no model files)\n" "$d"
+                  fi
+                else
+                  printf "  %s: missing\n" "$d"
+                fi
+              done
 
-              echo "Generating cases from datasets: $DATASET_ROOT"
-              node --trace-uncaught --unhandled-rejections=strict \
-                ./run-model-zoo-tests.js \
+              DATASET_ROOT=/datasets
+
+              echo "Generating cases from datasets..."
+              node ./run-model-zoo-tests.js \
                 --datasets "$DATASET_ROOT" \
                 --out tools/model_zoo/onnx_zoo
 
               echo "Running model-zoo tests..."
-              bash tools/model_zoo/test_generator/test_models.sh tools/model_zoo/onnx_zoo 2>&1 | tee "${ROOT}/raw.log"
+              bash tools/model_zoo/test_generator/test_models.sh tools/model_zoo/onnx_zoo 2>&1 | tee "/results/raw.log"
 
               shopt -s nullglob
+              mkdir -p /results/fp16 /results/fp32
               for p in fp16 fp32; do
                 src="tools/model_zoo/test_generator/logs/$p"
-                [ -d "$src" ] && cp -f "$src"/*.log "${ROOT}/$p/" || true
+                [ -d "$src" ] && cp -f "$src"/*.log "/results/$p/" || true
               done
 
-              # Write summarizer to a temp file (no nested-quote issues)
-              cat >/tmp/onnx_summarize.js <<'"'"'JS'"'"'
-              const fs = require("fs");
-              const path = require("path");
-              const runTs = process.env.RUN_TS;
-              const root = path.join("logs", runTs);
-              const precs = ["fp32", "fp16"];
+              # ---- Summarize with Node (safe heredoc) ----
+              cat >/tmp/onnx_summarize.js <<'JS'
+              const fs = require('fs');
+              const path = require('path');
+              const root = '/results';
+              const precs = ['fp32','fp16'];
               const summary = { totals: { pass: 0, fail: 0 }, regressions: {} };
-              function looksFailed(text){return /(Traceback \(most recent call last\)|\bERROR\b|AssertionError|Segmentation fault|^error:)/im.test(text);}
+              function looksFailed(text){return /(Traceback \(most recent call last\)|\bERROR\b|AssertionError|Segmentation fault|^error:)/im.test(text);}    
               function failureMessage(text){
                 const tb=[...text.matchAll(/Traceback \(most recent call last\):([\s\S]*?)(?:\n\s*\n|\Z)/g)];
-                if(tb.length){const block=tb[tb.length-1][1].trim().split(/\r?\n/).reverse();
-                  for(const line of block) if(line.trim()) return line.trim();}
+                if(tb.length){
+                  const block=tb[tb.length-1][1].trim().split(/\r?\n/).reverse();
+                  for(const line of block) if(line.trim()) return line.trim();
+                }
                 const lines=text.split(/\r?\n/).map(l=>l.trim()).filter(Boolean).reverse();
                 for(const l of lines) if (/(error|exception|failed|segmentation fault|assert)/i.test(l)) return l;
-                return "failed (see log)";
+                return 'failed (see log)';
               }
-              for (const prec of precs){
+              for(const prec of precs){
                 const d=path.join(root,prec); const reg={passed:[],failed:[]};
                 if(fs.existsSync(d)&&fs.statSync(d).isDirectory()){
-                  const files=fs.readdirSync(d).filter(f=>f.endsWith(".log")).sort();
-                  for (const fn of files){
+                  const files=fs.readdirSync(d).filter(f=>f.endsWith('.log')).sort();
+                  for(const fn of files){
                     const model=fn.slice(0,-4);
-                    const txt=fs.readFileSync(path.join(d,fn),"utf8");
+                    const txt=fs.readFileSync(path.join(d,fn),'utf8');
                     if(looksFailed(txt)){reg.failed.push({model,message:failureMessage(txt)});summary.totals.fail++;}
                     else {reg.passed.push(model);summary.totals.pass++;}
                   }
                 }
                 summary.regressions[prec]=reg;
               }
-              fs.writeFileSync(path.join(root,"summary.json"), JSON.stringify(summary,null,2));
+              fs.writeFileSync(path.join(root,'summary.json'), JSON.stringify(summary,null,2));
               const lines=[];
-              lines.push("## Totals",`- PASS: ${summary.totals.pass}`,`- FAIL: ${summary.totals.fail}`,"");
-              for (const prec of precs){
+              lines.push('## Totals');
+              lines.push(`- PASS: ${summary.totals.pass}`);
+              lines.push(`- FAIL: ${summary.totals.fail}`);
+              lines.push('');
+              for(const prec of precs){
                 const reg=summary.regressions[prec];
                 lines.push(`## ${prec.toUpperCase()}`);
                 lines.push(`**Passed (${reg.passed.length})**`);
-                if(reg.passed.length) reg.passed.forEach(m=>lines.push(`- ${m}`)); else lines.push("- none");
-                lines.push("");
+                if(reg.passed.length) reg.passed.forEach(m=>lines.push(`- ${m}`)); else lines.push('- none');
+                lines.push('');
                 lines.push(`**Failed (${reg.failed.length})**`);
-                if(reg.failed.length) reg.failed.forEach(it=>lines.push(`- ${it.model}: \\`${it.message}\\``)); else lines.push("- none");
-                lines.push("");
+                if(reg.failed.length) reg.failed.forEach(it=>lines.push(`- ${it.model}: \`${it.message}\``)); else lines.push('- none');
+                lines.push('');
               }
-              fs.writeFileSync(path.join(root,"summary.md"), lines.join("\n"));
+              fs.writeFileSync(path.join(root,'summary.md'), lines.join('\n'));
               JS
 
               node /tmp/onnx_summarize.js
             '
 
-      # --- NEW: fix ownership just in case (should be no-op with --user above) ---
-      - name: Normalize ownership of generated files
-        shell: bash
-        run: |
-          sudo chown -R "$(id -u)":"$(id -g)" "$GITHUB_WORKSPACE" || true
-
       - name: Upload logs and summary (timestamped)
         uses: actions/upload-artifact@v4
         with:
-          name: model-zoo-logs-${{ steps.ts.outputs.stamp }}
-          path: logs/${{ steps.ts.outputs.stamp }}
+          name: model-zoo-logs-${{ steps.results.outputs.run_ts }}
+          path: ${{ steps.results.outputs.host_results }}
           if-no-files-found: error
