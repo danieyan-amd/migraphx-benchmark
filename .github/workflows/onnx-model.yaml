@@ -56,7 +56,7 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v4
         with:
-          clean: false
+          clean: false  # avoid failing if prior root-owned files exist
 
       - name: Init timestamp
         id: ts
@@ -68,6 +68,7 @@ jobs:
         run: |
           set -euo pipefail
           RUN_TS="${{ steps.ts.outputs.stamp }}"
+          # Store results OUTSIDE the repo to avoid permission/cleanup issues
           RES_DIR="${RUNNER_TEMP}/onnx-${RUN_TS}"
           mkdir -p "$RES_DIR/fp16" "$RES_DIR/fp32"
           echo "run_ts=$RUN_TS" >> "$GITHUB_OUTPUT"
@@ -96,22 +97,18 @@ jobs:
           done
 
       - name: Run Model Zoo tests in container
-        shell: bash
         env:
           RUN_TS: ${{ steps.results.outputs.run_ts }}
-          DOCKER_IMAGE: ${{ env.DOCKER_IMAGE }}
+        shell: bash
         run: |
           set -euo pipefail
 
-          sed -i 's/\r$//' tools/model_zoo/test_generator/test_models.sh || true
-
-          if [ -z "${DOCKER_IMAGE:-}" ]; then
-            echo "ERROR: DOCKER_IMAGE is empty (check top-level env)"; exit 2; fi
-          echo "Using container image: ${DOCKER_IMAGE}"
-
           if [ ! -d "${DATASETS_DIR}" ]; then
-            echo "Datasets dir not found on host: ${DATASETS_DIR}"; exit 1; fi
+            echo "Datasets dir not found on host: ${DATASETS_DIR}"
+            exit 1
+          fi
 
+          # Guard: bail out fast if no models are present on host
           if ! find "${DATASETS_DIR}" -type f \( -name '*.onnx' -o -name '*.pb' \) -print -quit | grep -q . ; then
             echo "No .onnx/.pb files under ${DATASETS_DIR}. Skipping container run."
             mkdir -p "${{ steps.results.outputs.host_results }}"
@@ -120,11 +117,13 @@ jobs:
             exit 0
           fi
 
+          # Write the in-container script to a temp file on the host and mount it
           cat <<'INCON' > /tmp/in_container.sh
           set -euo pipefail
 
           echo "Datasets at /datasets"
 
+          # ---- Node.js for the JS generator ----
           if ! command -v node >/dev/null 2>&1; then
             apt-get update -y
             apt-get install -y --no-install-recommends ca-certificates curl gnupg
@@ -134,13 +133,16 @@ jobs:
             apt-get update -y && apt-get install -y --no-install-recommends nodejs
           fi
 
+          # ---- Install test-only deps (avoid torch/ort conflicts) ----
           if [ -f tools/model_zoo/test_generator/requirements.txt ]; then
             grep -viE "^(torch|torchvision|torchaudio|onnxruntime(-gpu)?)\\b" tools/model_zoo/test_generator/requirements.txt > .req_notorch.txt || true
             pip3 install -r .req_notorch.txt
           fi
 
           chmod +x tools/model_zoo/test_generator/test_models.sh || true
+          chmod +x ./run-model-zoo-tests.js || true
 
+          echo "Checking dataset candidates inside container..."
           for d in /usr/share/migraphx/migraph_datasets /datasets /saved-models /new-saved-models; do
             if [ -d "$d" ]; then
               if find "$d" -type f \( -name "*.onnx" -o -name "*.pb" \) -print -quit | grep -q . ; then
@@ -153,6 +155,7 @@ jobs:
             fi
           done
 
+          # Prefer the canonical MIGraphX datasets path if present, else fall back to /datasets
           if [ -d /usr/share/migraphx/migraph_datasets ]; then
             DATASET_ROOT=/usr/share/migraphx/migraph_datasets
           else
@@ -174,13 +177,14 @@ jobs:
             fi
           done
 
+          # ---- Summarize with Node (literal heredoc) ----
           cat <<'EOF' >/tmp/onnx_summarize.js
           const fs = require('fs');
           const path = require('path');
           const root = '/results';
           const precs = ['fp32','fp16'];
           const summary = { totals: { pass: 0, fail: 0 }, regressions: {} };
-          function looksFailed(text){return /(Traceback \(most recent call last\)|\bERROR\b|AssertionError|Segmentation fault|^error:)/im.test(text);} 
+          function looksFailed(text){return /(Traceback \(most recent call last\)|\bERROR\b|AssertionError|Segmentation fault|^error:)/im.test(text);}
           function failureMessage(text){
             const tb=[...text.matchAll(/Traceback \(most recent call last\):([\s\S]*?)(?:\n\s*\n|\Z)/g)];
             if(tb.length){
@@ -225,13 +229,13 @@ jobs:
 
           node /tmp/onnx_summarize.js
           INCON
+
           chmod +x /tmp/in_container.sh
 
           docker run --rm \
             --name model-zoo-${GITHUB_RUN_ID} \
             --device=/dev/kfd --device=/dev/dri --group-add=video \
             --network=host \
-            --user "$(id -u):$(id -g)" \
             -e TARGET=gpu \
             -e ATOL=0.001 -e RTOL=0.001 \
             -e RUN_TS="${RUN_TS}" \
@@ -240,13 +244,17 @@ jobs:
             -v /opt/rocm:/opt/rocm:ro \
             -v "${DATASETS_DIR}":/datasets:ro \
             -v "${DATASETS_DIR}":/usr/share/migraphx/migraph_datasets:ro \
+            
             -v "${{ steps.results.outputs.host_results }}":/results \
             -v "$GITHUB_WORKSPACE":/workspace \
+            --user "$(id -u):$(id -g)" \
+            
             -v /tmp/in_container.sh:/in_container.sh:ro \
             -w /workspace \
             "${DOCKER_IMAGE}" \
             bash /in_container.sh
 
+          # Ensure repo tree is cleanable by checkout next runs
           rm -rf tools/model_zoo/test_generator/logs/* || true
 
       - name: Upload logs and summary (timestamped)
