@@ -1,30 +1,30 @@
-name: ONNX Model Zoo Tests (PyTorch + MIGraphX)
+name: ONNX Model Zoo Tests (ROCm dev base + MIGraphX)
 
 on:
   workflow_call:
     inputs:
       rocm_release:
         required: true
-        type: string            # e.g. "6.4.2"
-      pytorch_base_tag:
+        type: string          # e.g. "6.4.2"
+      base_image:
         required: false
-        type: string            # overrideable if you need a specific rocm/pytorch tag
-        default: "rocm6.4.2_ubuntu22.04_py3.10_pytorch_2.4.0"
+        type: string          # override if you want; default below is robust
+        default: "rocm/dev-ubuntu-22.04"
       benchmark_utils_repo:
         required: true
-        type: string            # e.g. "ROCm/migraphx-benchmark-utils" or your fork
+        type: string
       onnx_reports_repo:
         required: true
         type: string
       organization:
         required: true
-        type: string            # "AMD" or "HTEC"
+        type: string
       result_number:
         required: true
         type: string
       model_timeout:
         required: true
-        type: string            # "30m"
+        type: string
     secrets:
       gh_token:
         required: true
@@ -42,15 +42,10 @@ env:
   DATASETS_DIR: /usr/share/migraphx/saved-models
   TEST_RESULTS_PATH: /usr/share/migraphx/${{ inputs.organization }}/test-results
   REPORTS_PATH: /usr/share/migraphx/${{ inputs.organization }}/reports
-  MAIL_TO: ""
-  MAIL_CC: ""
-  MAIL_FROM: GH Actions
-  MAIL_SUBJECT: Nightly ONNX run
-  MAIL_BODY: Scheduled ONNX run on develop branch
 
 jobs:
   onnx_zoo:
-    runs-on: [self-hosted, Linux, X64]   # your gpu942f runner is fine
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 120
 
     steps:
@@ -60,49 +55,51 @@ jobs:
           case "${RUNNER_NAME:-unknown}" in
             GPU942F_1|gpu942f) GPU=0; CPU="0-63" ;;
             GPU942F_2)         GPU=4; CPU="64-127" ;;
-            *) echo "Unknown runner ${RUNNER_NAME:-?}, defaulting GPU=0, all CPUs"; GPU=0; CPU="0-$(( $(nproc)-1 ))" ;;
+            *) echo "Unknown runner ${RUNNER_NAME:-?}, default GPU=0, all CPUs"; GPU=0; CPU="0-$(( $(nproc)-1 ))" ;;
           esac
           echo "GPU=$GPU" >> $GITHUB_ENV
           echo "CPU=$CPU" >> $GITHUB_ENV
 
-      - name: Checkout AMDMIGraphX code
+      - name: Checkout AMDMIGraphX
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ secrets.gh_token }}
 
-      - name: Checkout benchmark utils
+      - name: Checkout benchmark-utils
         uses: actions/checkout@v4
         with:
           repository: ${{ inputs.benchmark_utils_repo }}
           path: ${{ env.UTILS_DIR }}
           token: ${{ secrets.gh_token }}
 
-      - name: Write lightweight Dockerfile (PyTorch+ROCm base)
+      - name: Write Dockerfile (ROCm dev base)
         run: |
           cat > Dockerfile.onnx << 'DOCKER'
-          ARG PT_TAG
-          FROM rocm/pytorch:${PT_TAG}
+          ARG BASE_IMAGE
+          ARG ROCM_REL
 
-          # Basics + Node.js (JS generator), jq, bash tools
+          FROM ${BASE_IMAGE}:${ROCM_REL}
+
+          # Tools + Node.js for the JS case generator
           RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-               ca-certificates curl gnupg build-essential git cmake pkg-config python3-pip python3-dev \
-               jq bash coreutils findutils sed gawk \
-            && install -d /etc/apt/keyrings \
-            && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
-            && echo 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main' > /etc/apt/sources.list.d/nodesource.list \
-            && apt-get update && apt-get install -y --no-install-recommends nodejs \
-            && rm -rf /var/lib/apt/lists/*
+                ca-certificates curl gnupg build-essential git cmake pkg-config python3 python3-pip python3-dev \
+                jq bash coreutils findutils sed gawk \
+             && install -d /etc/apt/keyrings \
+             && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+             && echo 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main' > /etc/apt/sources.list.d/nodesource.list \
+             && apt-get update && apt-get install -y --no-install-recommends nodejs \
+             && rm -rf /var/lib/apt/lists/*
 
-          # Create workdir
           WORKDIR /workspace
           DOCKER
 
       - name: Build ONNX runner image
         run: |
           docker build \
-            --build-arg PT_TAG=${{ inputs.pytorch_base_tag }} \
-            -t onnx-pytorch-migraphx:${{ github.sha }} \
+            --build-arg BASE_IMAGE=${{ inputs.base_image }} \
+            --build-arg ROCM_REL=${{ inputs.rocm_release }} \
+            -t onnx-rocm-migraphx:${{ github.sha }} \
             -f Dockerfile.onnx .
 
       - name: Init timestamp
@@ -129,26 +126,26 @@ jobs:
             -v "${{ env.DATASETS_DIR }}:/datasets:ro" \
             -v "${{ env.TEST_RESULTS_PATH }}:${{ env.TEST_RESULTS_PATH }}" \
             -v "$PWD/${{ env.UTILS_DIR }}/scripts:/migraphx/sh:ro" \
-            onnx-pytorch-migraphx:${{ github.sha }} \
+            onnx-rocm-migraphx:${{ github.sha }} \
             bash -lc '
               set -euo pipefail
               cd /workspace
 
-              # --- Install Python deps (filter out torch/onnxruntime-gpu) ---
+              # 1) Install Python deps (skip torch/onnxruntime-gpu if present)
               if [ -f tools/model_zoo/test_generator/requirements.txt ]; then
                 grep -viE "^(torch|torchvision|torchaudio|onnxruntime-gpu)\b" tools/model_zoo/test_generator/requirements.txt > .req_notorch.txt || true
                 python3 -m pip install --upgrade pip
                 pip3 install -r .req_notorch.txt
               fi
 
-              # --- Build MIGraphX (uses benchmark-utils script) ---
+              # 2) Build MIGraphX using benchmark-utils helper
               /migraphx/sh/build_migraphx.sh
 
-              # --- Export so Python can import + find libs ---
+              # 3) Export paths so python + libs can find MIGraphX
               export PYTHONPATH=/src/AMDMIGraphX/build/lib:${PYTHONPATH:-}
               export LD_LIBRARY_PATH=/src/AMDMIGraphX/build/lib:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
 
-              # --- Make scripts runnable ---
+              # 4) Ensure scripts are executable
               chmod +x tools/model_zoo/test_generator/test_models.sh || true
               chmod +x ./run-model-zoo-tests.js || true
 
@@ -156,20 +153,19 @@ jobs:
               node --version
               python3 --version
 
-              # --- Generate cases + run tests ---
+              # 5) Generate cases and run
               node ./run-model-zoo-tests.js --datasets /datasets --out tools/model_zoo/onnx_zoo
-
               mkdir -p "'"$ROOT"'/fp16" "'"$ROOT"'/fp32"
               bash tools/model_zoo/test_generator/test_models.sh tools/model_zoo/onnx_zoo 2>&1 | tee "'"$ROOT"'/raw.log"
 
-              # Copy per-model logs back into the timestamped folder
+              # 6) Copy per-model logs
               shopt -s nullglob
               for p in fp16 fp32; do
                 src="tools/model_zoo/test_generator/logs/$p"
                 [ -d "$src" ] && cp -f "$src"/*.log "'"$ROOT"'/$p/" || true
               done
 
-              # Summarize (write a tiny JS file to avoid heredoc quoting issues)
+              # 7) Summarize (write a tiny JS and run it)
               cat >/tmp/onnx_summarize.js << "JS"
               const fs=require("fs"),path=require("path");
               const runTs=process.env.RUN_TS;
@@ -218,7 +214,7 @@ jobs:
               node /tmp/onnx_summarize.js
             '
 
-      - name: Upload logs and summary (timestamped)
+      - name: Upload logs and summary
         uses: actions/upload-artifact@v4
         with:
           name: model-zoo-logs-${{ steps.ts.outputs.stamp }}
