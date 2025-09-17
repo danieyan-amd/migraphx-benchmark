@@ -29,9 +29,7 @@ permissions:
   contents: read
 
 env:
-  # Container base (simple, has PyTorch+Python)
   DOCKER_IMAGE: rocm/pytorch:latest
-  # Typical dataset locations (mounted read-only)
   DATASETS_DIR: /usr/share/migraphx/migraph_datasets
 
 jobs:
@@ -40,10 +38,24 @@ jobs:
     timeout-minutes: 90
 
     steps:
+      # --- NEW: clean any root-owned leftovers BEFORE checkout tries to clean ---
+      - name: Pre-clean workspace (logs & test logs)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # These may exist from a prior run (root-owned)
+          sudo rm -rf "$GITHUB_WORKSPACE/logs" || true
+          sudo rm -rf "$GITHUB_WORKSPACE/tools/model_zoo/test_generator/logs" || true
+          # Ensure repo dir is all owned by runner
+          sudo chown -R "$(id -u)":"$(id -g)" "$GITHUB_WORKSPACE" || true
+
       - name: Checkout sources
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.gh_token }}
+          # clean:true is fine now that we fixed ownership above
+          clean: true
+          fetch-depth: 0
 
       - name: Init timestamp
         id: ts
@@ -69,15 +81,20 @@ jobs:
             fi
           done
 
-      - name: Run ONNX model-zoo inside container
+      - name: Run ONNX model-zoo inside container (as runner user)
         shell: bash
         env:
           RUN_TS: ${{ steps.ts.outputs.stamp }}
         run: |
           set -euo pipefail
 
+          # Ensure our log dirs exist and are owned by runner
+          mkdir -p "$GITHUB_WORKSPACE/logs/${RUN_TS}"/{fp16,fp32}
+          chmod -R u+rwX "$GITHUB_WORKSPACE/logs" || true
+
           docker run --rm \
             --name model-zoo-${GITHUB_RUN_ID} \
+            --user "$(id -u)":"$(id -g)" \
             --device=/dev/kfd --device=/dev/dri --group-add=video \
             --network=host \
             -e TARGET=gpu \
@@ -113,7 +130,6 @@ jobs:
                   break
                 fi
               done
-
               if [ -z "${DATASET_ROOT:-}" ]; then
                 echo "ERROR: No .onnx/.pb files under /datasets, /saved-models, or /new-saved-models."
                 exit 1
@@ -160,72 +176,60 @@ jobs:
                 [ -d "$src" ] && cp -f "$src"/*.log "${ROOT}/$p/" || true
               done
 
-              # Write summarizer to a temp file (avoids nested-quote issues)
+              # Write summarizer to a temp file (no nested-quote issues)
               cat >/tmp/onnx_summarize.js <<'"'"'JS'"'"'
               const fs = require("fs");
               const path = require("path");
-
               const runTs = process.env.RUN_TS;
               const root = path.join("logs", runTs);
               const precs = ["fp32", "fp16"];
               const summary = { totals: { pass: 0, fail: 0 }, regressions: {} };
-
-              function looksFailed(text) {
-                return /(Traceback \(most recent call last\)|\bERROR\b|AssertionError|Segmentation fault|^error:)/im.test(text);
-              }
-              function failureMessage(text) {
-                const tb = [...text.matchAll(/Traceback \(most recent call last\):([\s\S]*?)(?:\n\s*\n|\Z)/g)];
-                if (tb.length) {
-                  const block = tb[tb.length - 1][1].trim().split(/\r?\n/).reverse();
-                  for (const line of block) if (line.trim()) return line.trim();
-                }
-                const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean).reverse();
-                for (const l of lines) if (/(error|exception|failed|segmentation fault|assert)/i.test(l)) return l;
+              function looksFailed(text){return /(Traceback \(most recent call last\)|\bERROR\b|AssertionError|Segmentation fault|^error:)/im.test(text);}
+              function failureMessage(text){
+                const tb=[...text.matchAll(/Traceback \(most recent call last\):([\s\S]*?)(?:\n\s*\n|\Z)/g)];
+                if(tb.length){const block=tb[tb.length-1][1].trim().split(/\r?\n/).reverse();
+                  for(const line of block) if(line.trim()) return line.trim();}
+                const lines=text.split(/\r?\n/).map(l=>l.trim()).filter(Boolean).reverse();
+                for(const l of lines) if (/(error|exception|failed|segmentation fault|assert)/i.test(l)) return l;
                 return "failed (see log)";
               }
-
-              for (const prec of precs) {
-                const d = path.join(root, prec);
-                const reg = { passed: [], failed: [] };
-                if (fs.existsSync(d) && fs.statSync(d).isDirectory()) {
-                  const files = fs.readdirSync(d).filter(f => f.endsWith(".log")).sort();
-                  for (const fn of files) {
-                    const model = fn.slice(0, -4);
-                    const txt = fs.readFileSync(path.join(d, fn), "utf8");
-                    if (looksFailed(txt)) {
-                      reg.failed.push({ model, message: failureMessage(txt) });
-                      summary.totals.fail += 1;
-                    } else {
-                      reg.passed.push(model);
-                      summary.totals.pass += 1;
-                    }
+              for (const prec of precs){
+                const d=path.join(root,prec); const reg={passed:[],failed:[]};
+                if(fs.existsSync(d)&&fs.statSync(d).isDirectory()){
+                  const files=fs.readdirSync(d).filter(f=>f.endsWith(".log")).sort();
+                  for (const fn of files){
+                    const model=fn.slice(0,-4);
+                    const txt=fs.readFileSync(path.join(d,fn),"utf8");
+                    if(looksFailed(txt)){reg.failed.push({model,message:failureMessage(txt)});summary.totals.fail++;}
+                    else {reg.passed.push(model);summary.totals.pass++;}
                   }
                 }
-                summary.regressions[prec] = reg;
+                summary.regressions[prec]=reg;
               }
-
-              fs.writeFileSync(path.join(root, "summary.json"), JSON.stringify(summary, null, 2));
-
-              const lines = [];
-              lines.push("## Totals");
-              lines.push(`- PASS: ${summary.totals.pass}`);
-              lines.push(`- FAIL: ${summary.totals.fail}`);
-              lines.push("");
-              for (const prec of precs) {
-                const reg = summary.regressions[prec];
+              fs.writeFileSync(path.join(root,"summary.json"), JSON.stringify(summary,null,2));
+              const lines=[];
+              lines.push("## Totals",`- PASS: ${summary.totals.pass}`,`- FAIL: ${summary.totals.fail}`,"");
+              for (const prec of precs){
+                const reg=summary.regressions[prec];
                 lines.push(`## ${prec.toUpperCase()}`);
                 lines.push(`**Passed (${reg.passed.length})**`);
-                if (reg.passed.length) reg.passed.forEach(m => lines.push(`- ${m}`)); else lines.push("- none");
+                if(reg.passed.length) reg.passed.forEach(m=>lines.push(`- ${m}`)); else lines.push("- none");
                 lines.push("");
                 lines.push(`**Failed (${reg.failed.length})**`);
-                if (reg.failed.length) reg.failed.forEach(it => lines.push(`- ${it.model}: \`${it.message}\``)); else lines.push("- none");
+                if(reg.failed.length) reg.failed.forEach(it=>lines.push(`- ${it.model}: \\`${it.message}\\``)); else lines.push("- none");
                 lines.push("");
               }
-              fs.writeFileSync(path.join(root, "summary.md"), lines.join("\n"));
+              fs.writeFileSync(path.join(root,"summary.md"), lines.join("\n"));
               JS
 
               node /tmp/onnx_summarize.js
             '
+
+      # --- NEW: fix ownership just in case (should be no-op with --user above) ---
+      - name: Normalize ownership of generated files
+        shell: bash
+        run: |
+          sudo chown -R "$(id -u)":"$(id -g)" "$GITHUB_WORKSPACE" || true
 
       - name: Upload logs and summary (timestamped)
         uses: actions/upload-artifact@v4
