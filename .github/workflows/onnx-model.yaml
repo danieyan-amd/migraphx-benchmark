@@ -1,18 +1,18 @@
-name: MIGraphX ONNX Model Tests (reusable, thin PyTorch image)
+name: MIGraphX ONNX Model Tests (no Docker)
 
 on:
   workflow_call:
     inputs:
       rocm_release:
-        description: ROCm Version (for parity with caller; not used by image)
+        description: ROCm Version (parity only)
         type: string
         required: true
       onnx_reports_repo:
-        description: Repository where ONNX reports are stored (optional use downstream)
+        description: Repo where ONNX reports are stored (optional downstream)
         type: string
         required: true
       benchmark_utils_repo:
-        description: Repo for utils (accepted for parity; not used here)
+        description: Repo for utils (parity only)
         type: string
         required: true
       organization:
@@ -20,32 +20,27 @@ on:
         type: string
         required: true
       result_number:
-        description: Last N results (accepted for parity)
+        description: Last N results (parity only)
         type: string
         required: true
       model_timeout:
-        description: Per-model timeout (accepted for parity)
+        description: Per-model timeout (parity only)
         type: string
         required: true
     secrets:
       gh_token:
-        description: GitHub token (optional; used when checking out reports repo)
+        description: GitHub token (optional; only if you need to checkout other repos)
         required: false
 
 permissions:
   contents: read
 
 env:
+  # Datasets and ROCm libs expected on the self-hosted runner
   DATASETS_DIR: /usr/share/migraphx/migraph_datasets
-  LOG_ROOT: logs
-
-  # Image knob — we stick to a thin public ROCm PyTorch image
-  PT_TAG: latest
-  DOCKER_IMAGE: "rocm/pytorch:latest"
-
-  # Keep these in env so container inherits
   PYTHONPATH: /opt/rocm/lib
   LD_LIBRARY_PATH: /opt/rocm/lib
+  LOG_ROOT: logs
 
 jobs:
   model-zoo-tests:
@@ -56,7 +51,7 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v4
         with:
-          clean: false  # avoid failing if prior root-owned files exist
+          clean: false  # avoid failing if prior files are not deletable
 
       - name: Init timestamp
         id: ts
@@ -68,7 +63,6 @@ jobs:
         run: |
           set -euo pipefail
           RUN_TS="${{ steps.ts.outputs.stamp }}"
-          # Store results OUTSIDE the repo to avoid permission/cleanup issues
           RES_DIR="${RUNNER_TEMP}/onnx-${RUN_TS}"
           mkdir -p "$RES_DIR/fp16" "$RES_DIR/fp32"
           echo "run_ts=$RUN_TS" >> "$GITHUB_OUTPUT"
@@ -96,42 +90,34 @@ jobs:
             fi
           done
 
-      - name: Run Model Zoo tests in container
+      - name: Run Model Zoo tests on host (no Docker)
+        shell: bash
         env:
           RUN_TS: ${{ steps.results.outputs.run_ts }}
-        shell: bash
         run: |
           set -euo pipefail
+
+          # Normalize line endings (no-op on Linux)
+          sed -i 's/\r$//' tools/model_zoo/test_generator/test_models.sh || true
 
           if [ ! -d "${DATASETS_DIR}" ]; then
             echo "Datasets dir not found on host: ${DATASETS_DIR}"
             exit 1
           fi
 
-          # Guard: bail out fast if no models are present on host
+          # Bail fast if no models present
           if ! find "${DATASETS_DIR}" -type f \( -name '*.onnx' -o -name '*.pb' \) -print -quit | grep -q . ; then
-            echo "No .onnx/.pb files under ${DATASETS_DIR}. Skipping container run."
+            echo "No .onnx/.pb files under ${DATASETS_DIR}. Skipping run."
             mkdir -p "${{ steps.results.outputs.host_results }}"
             printf '## Totals\n- PASS: 0\n- FAIL: 0\n' > "${{ steps.results.outputs.host_results }}/summary.md"
             printf '{"totals":{"pass":0,"fail":0},"regressions":{"fp32":{"passed":[],"failed":[]},"fp16":{"passed":[],"failed":[]}}}\n' > "${{ steps.results.outputs.host_results }}/summary.json"
             exit 0
           fi
 
-          # Write the in-container script to a temp file on the host and mount it
-          cat <<'INCON' > /tmp/in_container.sh
-          set -euo pipefail
-
-          echo "Datasets at /datasets"
-
-          # ---- Install test-only deps (avoid torch/ort conflicts) ---- (avoid torch/ort conflicts) ----
-          if [ -f tools/model_zoo/test_generator/requirements.txt ]; then
-            grep -viE "^(torch|torchvision|torchaudio|onnxruntime(-gpu)?)\\b" tools/model_zoo/test_generator/requirements.txt > .req_notorch.txt || true
-            pip3 install --user -r .req_notorch.txt
-          fi
-
           chmod +x tools/model_zoo/test_generator/test_models.sh || true
-                    echo "Checking dataset candidates inside container..."
-          for d in /usr/share/migraphx/migraph_datasets /datasets /saved-models /new-saved-models; do
+
+          echo "Checking dataset candidates on host..."
+          for d in /usr/share/migraphx/migraph_datasets "${DATASETS_DIR}"; do
             if [ -d "$d" ]; then
               if find "$d" -type f \( -name "*.onnx" -o -name "*.pb" \) -print -quit | grep -q . ; then
                 printf "  %s: present (has model files)\n" "$d"
@@ -143,68 +129,37 @@ jobs:
             fi
           done
 
-          # Prefer the canonical MIGraphX datasets path if present, else fall back to /datasets
-          if [ -d /usr/share/migraphx/migraph_datasets ]; then
-            DATASET_ROOT=/usr/share/migraphx/migraph_datasets
-          else
-            DATASET_ROOT=/datasets
-          fi
+          DATASET_ROOT="${DATASETS_DIR}"
 
           echo "Running model-zoo tests from ${DATASET_ROOT}..."
-          bash tools/model_zoo/test_generator/test_models.sh "${DATASET_ROOT}" 2>&1 | tee "/results/raw.log"
+          bash tools/model_zoo/test_generator/test_models.sh "${DATASET_ROOT}" 2>&1 | tee "${{ steps.results.outputs.host_results }}/raw.log"
 
+          # Copy per-precision logs to results dir if present
           shopt -s nullglob
-          mkdir -p /results/fp16 /results/fp32
+          mkdir -p "${{ steps.results.outputs.host_results }}/fp16" "${{ steps.results.outputs.host_results }}/fp32"
           for p in fp16 fp32; do
             src="tools/model_zoo/test_generator/logs/$p"
             if [ -d "$src" ]; then
               files=( "$src"/*.log )
               if [ -e "${files[0]}" ]; then
-                cp -f "${files[@]}" "/results/$p/"
+                cp -f "${files[@]}" "${{ steps.results.outputs.host_results }}/$p/"
               fi
             fi
           done
 
-          # ---- Summarize results with Python script ----
-          if [ -f /workspace/scripts/summarize_onnx_logs.py ]; then
-            python3 /workspace/scripts/summarize_onnx_logs.py --results /results
-          else
-            echo "summarize_onnx_logs.py not found; writing minimal summary"
-            printf '## Totals
-- PASS: 0
-- FAIL: 0
-' > /results/summary.md
-            printf '{"totals":{"pass":0,"fail":0},"regressions":{"fp32":{"passed":[],"failed":[]},"fp16":{"passed":[],"failed":[]}}}
-' > /results/summary.json
-          fi
-          INCON
-
-          chmod +x /tmp/in_container.sh
-
-          docker run --rm \
-            --name model-zoo-${GITHUB_RUN_ID} \
-            --device=/dev/kfd --device=/dev/dri --group-add=video \
-            --network=host \
-            -e TARGET=gpu \
-            -e ATOL=0.001 -e RTOL=0.001 \
-            -e RUN_TS="${RUN_TS}" \
-            -e PYTHONPATH=${PYTHONPATH} \
-            -e LD_LIBRARY_PATH=${LD_LIBRARY_PATH} \
-            -v /opt/rocm:/opt/rocm:ro \
-            -v "${DATASETS_DIR}":/datasets:ro \
-            -v "${DATASETS_DIR}":/usr/share/migraphx/migraph_datasets:ro \
-            
-            -v "${{ steps.results.outputs.host_results }}":/results \
-            -v "$GITHUB_WORKSPACE":/workspace \
-            --user "$(id -u):$(id -g)" \
-            
-            -v /tmp/in_container.sh:/in_container.sh:ro \
-            -w /workspace \
-            "${DOCKER_IMAGE}" \
-            bash /in_container.sh
-
-          # Ensure repo tree is cleanable by checkout next runs
+          # Keep repo clean for next runs
           rm -rf tools/model_zoo/test_generator/logs/* || true
+
+      - name: Summarize results
+        shell: bash
+        env:
+          RESULTS_DIR: ${{ steps.results.outputs.host_results }}
+        run: |
+          set -euo pipefail
+          python3 scripts/summarize_onnx_logs.py \
+            --results "${RESULTS_DIR}" \
+            --out-json "${RESULTS_DIR}/summary.json" \
+            --out-md   "${RESULTS_DIR}/summary.md"
 
       - name: Upload logs and summary (timestamped)
         uses: actions/upload-artifact@v4
