@@ -1,510 +1,226 @@
-name: MIGraphX ONNX Model Tests (perf-structured)
+name: ONNX Model Zoo Tests (PyTorch + MIGraphX)
 
 on:
   workflow_call:
     inputs:
       rocm_release:
-        type: string
         required: true
-      onnx_reports_repo:
-        type: string
-        required: true
+        type: string            # e.g. "6.4.2"
+      pytorch_base_tag:
+        required: false
+        type: string            # overrideable if you need a specific rocm/pytorch tag
+        default: "rocm6.4.2_ubuntu22.04_py3.10_pytorch_2.4.0"
       benchmark_utils_repo:
-        type: string
         required: true
+        type: string            # e.g. "ROCm/migraphx-benchmark-utils" or your fork
+      onnx_reports_repo:
+        required: true
+        type: string
       organization:
-        type: string
         required: true
+        type: string            # "AMD" or "HTEC"
       result_number:
-        type: string
         required: true
+        type: string
       model_timeout:
-        type: string
         required: true
-      # optional knobs
-      force_rebuild_base:
-        type: boolean
-        required: false
-        default: false
-      use_docker:
-        type: boolean
-        required: false
-        default: true
+        type: string            # "30m"
     secrets:
       gh_token:
         required: true
       mail_user:
-        required: true
+        required: false
       mail_pass:
-        required: true
+        required: false
 
 permissions:
   contents: read
 
 env:
-  # perf-style env
   UTILS_DIR: benchmark-utils
   REPORTS_DIR: migraphx-reports
-  DOCKERBASE: rocm-migraphx:${{ inputs.rocm_release }}
-  MIOPENTUNE: miopen-dbs/rocm${{ inputs.rocm_release }}
+  DATASETS_DIR: /usr/share/migraphx/saved-models
+  TEST_RESULTS_PATH: /usr/share/migraphx/${{ inputs.organization }}/test-results
+  REPORTS_PATH: /usr/share/migraphx/${{ inputs.organization }}/reports
   MAIL_TO: ""
   MAIL_CC: ""
   MAIL_FROM: GH Actions
   MAIL_SUBJECT: Nightly ONNX run
   MAIL_BODY: Scheduled ONNX run on develop branch
-  PR_ID: ${{ github.event.number }}
-  BRANCH_NAME: develop
-  REPORTS_PATH: /usr/share/migraphx/${{ inputs.organization }}/reports
-  TEST_RESULTS_PATH: /usr/share/migraphx/${{ inputs.organization }}/test-results
-  MIGRAPHX_PATH: /usr/share/migraphx/${{ inputs.organization }}
 
 jobs:
-  onnx_test:
-    name: MIGraphX ONNX Model Zoo
-    if: ${{ !contains(github.event.pull_request_target.labels.*.name, 'skip bot checks') }}
-    runs-on: [self-hosted, Linux, X64]
+  onnx_zoo:
+    runs-on: [self-hosted, Linux, X64]   # your gpu942f runner is fine
     timeout-minutes: 120
-    outputs:
-      git_sha: ${{ steps.git_sha.outputs.git_sha }}
 
     steps:
-      - name: Clean up canceled runs
-        continue-on-error: true
+      - name: Map runner to GPU/CPU
         shell: bash
         run: |
-          wf_id=$(curl -H "Authorization: token ${{ secrets.gh_token }}" \
-            ${{ github.api_url }}/repos/${{ github.repository }}/actions/workflows \
-            | jq -r '.workflows[] | {id, name}| select(.name == "${{ github.workflow }}") | .id')
-          cancel_id=$(curl -H "Authorization: token ${{ secrets.gh_token }}" \
-            ${{ github.api_url }}/repos/${{ github.repository }}/actions/workflows/$wf_id/runs?per_page=10 \
-            | jq -r '.workflow_runs[] | {id, run_number, conclusion} | select(.conclusion == "cancelled") | {id, run_number}' \
-            | jq -s '.[0].id' || true)
-          docker stop onnx-test-$cancel_id || true
-          cancel_id=$(curl -H "Authorization: token ${{ secrets.gh_token }}" \
-            ${{ github.api_url }}/repos/${{ github.repository }}/actions/workflows/$wf_id/runs?per_page=10 \
-            | jq -r '.workflow_runs[] | {id, run_number, conclusion} | select(.conclusion == "cancelled") | {id, run_number}' \
-            | jq -s '.[1].id' || true)
-          docker stop onnx-test-$cancel_id || true
-          cancel_id=$(curl -H "Authorization: token ${{ secrets.gh_token }}" \
-            ${{ github.api_url }}/repos/${{ github.repository }}/actions/workflows/$wf_id/runs?per_page=10 \
-            | jq -r '.workflow_runs[] | {id, run_number, conclusion} | select(.conclusion == "cancelled") | {id, run_number}' \
-            | jq -s '.[2].id' || true)
-          docker stop onnx-test-$cancel_id || true
-
-      # Map runner names → GPU/CPU masks (includes your gpu942f)
-      - name: Get runner ID
-        shell: bash
-        run: |
-          set -euo pipefail
-          NAME="${RUNNER_NAME:-unknown}"
-          case "$NAME" in
-            GPU942F_1|gpu942f)
-              GPU=0
-              CPU="0-63"
-              ;;
-            GPU942F_2)
-              GPU=4
-              CPU="64-127"
-              ;;
-            *)
-              echo "Unknown RUNNER_NAME: $NAME — defaulting to GPU=0, all CPUs"
-              GPU=0
-              CPU="0-$(( $(nproc) - 1 ))"
-              ;;
+          case "${RUNNER_NAME:-unknown}" in
+            GPU942F_1|gpu942f) GPU=0; CPU="0-63" ;;
+            GPU942F_2)         GPU=4; CPU="64-127" ;;
+            *) echo "Unknown runner ${RUNNER_NAME:-?}, defaulting GPU=0, all CPUs"; GPU=0; CPU="0-$(( $(nproc)-1 ))" ;;
           esac
           echo "GPU=$GPU" >> $GITHUB_ENV
           echo "CPU=$CPU" >> $GITHUB_ENV
 
-      - name: Set GPU parameters
-        if: ${{ github.event.action != 'closed' }}
-        run: sudo rocm-smi --device ${{ env.GPU }} --setsrange 700 800 --autorespond y
-
-      - name: Install small python libs (host)
-        if: ${{ github.event.action != 'closed' }}
-        run: pip install tabulate==0.8.9 pandas==1.4.2 numpy==1.22.3 openpyxl==3.1.2
-
-      - name: Update PR env
-        if: ${{ github.event_name == 'pull_request_target' }}
-        shell: bash
-        run: |
-          sanitized_branch_name=$(echo "${{ github.head_ref }}" | sed 's/[^a-zA-Z0-9._\/]/-/g')
-          echo "BRANCH_NAME=$sanitized_branch_name" >> $GITHUB_ENV
-          echo "TEST_RESULTS_PATH=$(echo "$TEST_RESULTS_PATH-$PR_ID")" >> $GITHUB_ENV
-
-      - name: Checkout code (AMDMIGraphX)
-        if: ${{ github.event.action != 'closed' }}
+      - name: Checkout AMDMIGraphX code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ env.BRANCH_NAME }}
-          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
-          token: ${{ secrets.gh_token || github.token }}
-
-      # Confirm the PAT can see the utils repo (quick sanity)
-      - name: Sanity-check PAT can see utils repo
-        shell: bash
-        run: |
-          code=$(curl -s -o /dev/null -w "%{http_code}\n" \
-            -H "Authorization: token ${{ secrets.gh_token }}" \
-            https://api.github.com/repos/${{ inputs.benchmark_utils_repo }})
-          echo "API status for ${{ inputs.benchmark_utils_repo }}: $code"
-          [ "$code" = "200" ] || { echo "Token cannot read repo (code=$code)"; exit 1; }
-
-      - name: Checkout utils (manual clone)
-        if: ${{ github.event.action != 'closed' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          REPO="${{ inputs.benchmark_utils_repo }}"
-          DEST="${{ env.UTILS_DIR }}"
-          rm -rf "$DEST"
-          for B in main master; do
-            if git ls-remote --heads "https://x-access-token:${{ secrets.gh_token }}@github.com/${REPO}.git" "$B" >/dev/null 2>&1; then
-              BRANCH="$B"; break
-            fi
-          done
-          : "${BRANCH:=main}"
-          echo "Cloning ${REPO} (branch: ${BRANCH}) into ${DEST}"
-          git clone --depth 1 --branch "$BRANCH" \
-            "https://x-access-token:${{ secrets.gh_token }}@github.com/${REPO}.git" "$DEST"
-
-      # ---------- SAFE versions (no branch switching) ----------
-      - name: Calculate HASH
-        if: ${{ github.event.action != 'closed' }}
-        id: hash
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE"
-
-          # Collect candidate files (Dockerfiles, prereqs, requirements, rbuild.ini)
-          mapfile -d '' FILES < <(
-            find . -type f \( \
-              -path './dockerfiles/Base.Dockerfile' -o \
-              -path './dockerfiles/Daily.Dockerfile' -o \
-              -name 'install_prereqs.sh'         -o \
-              -name 'rbuild.ini'                  -o \
-              -name '*requirements.txt'           -o \
-              -name 'requirements-py.txt' \
-            \) -print0 2>/dev/null || true
-          )
-
-          if (( ${#FILES[@]} > 0 )); then
-            # Stable order + hash of hashes → short tag
-            rocm_hash="$(printf '%s\0' "${FILES[@]}" \
-              | sort -z \
-              | xargs -0 sha256sum \
-              | sha256sum \
-              | cut -c1-6)"
-          else
-            # Fallback when none of the files exist in this branch/PR
-            rocm_hash="$(git rev-parse --short=6 HEAD)"
-            echo "No docker/requirements/prereqs files found; falling back to git SHA: ${rocm_hash}"
-          fi
-
-          echo "HASH=${rocm_hash}" >> "$GITHUB_ENV"
-
-
-      - name: Get git SHA
-        if: ${{ github.event.action != 'closed' }}
-        id: git_sha
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE"
-          SHA="$(git rev-parse --short=6 HEAD)"
-          echo "git_sha=$SHA" >> "$GITHUB_OUTPUT"
-      # ---------------------------------------------------------
-
-      - name: Check image hash
-        if: ${{ github.event.action != 'closed' }}
-        id: check_hash
-        shell: bash
-        run: |
-          echo "DOCKERBASE=rocm-migraphx:${{ inputs.rocm_release }}-${{ env.HASH }}" >> $GITHUB_ENV
-          if [ -z "$(docker images -q rocm-migraphx:${{ inputs.rocm_release }}-${{ env.HASH }})" ]; then
-            # on PRs, don't force rebuild unless input says so
-            if [[ "${{ github.event_name }}" == "pull_request_target" && "${{ inputs.force_rebuild_base }}" != "true" ]]; then
-              echo "image=false" >> $GITHUB_ENV
-              echo "Base missing, but skipping rebuild on PR."
-            else
-              echo "image=true" >> $GITHUB_ENV
-              echo "Base will be rebuilt."
-            fi
-          else
-            echo "image=false" >> $GITHUB_ENV
-            echo "Base image already present."
-          fi
-
-      - name: Rebuild ROCm base (utils script)
-        if: ${{ env.image == 'true' && inputs.force_rebuild_base && inputs.use_docker }}
-        env:
-          ROCM_RELEASE: ${{ inputs.rocm_release }}
-          DOCKERIMAGE: rocm-migraphx:${{ inputs.rocm_release }}-${{ env.HASH }}
-          BUILD_NAVI: 0
-          TOKEN: ${{ secrets.gh_token }}
-        shell: bash
-        run: |
-          cd "$GITHUB_WORKSPACE/${{ env.UTILS_DIR }}/scripts"
-          ./build_migraphx_docker.sh ${{ inputs.benchmark_utils_repo }} ${{ github.event.pull_request.head.repo.full_name || github.repository }} ${{ env.BRANCH_NAME }}
-
-      - name: Docker build (utils Daily.Dockerfile)
-        if: ${{ github.event.action != 'closed' && inputs.use_docker }}
-        shell: bash
-        run: >
-          cd $GITHUB_WORKSPACE/${{ env.UTILS_DIR }} && docker build
-          --build-arg BRANCH=${{ env.BRANCH_NAME }}
-          --build-arg DOCKERBASE=${{ env.DOCKERBASE }}
-          --build-arg MIOPENTUNE=${{ env.MIOPENTUNE }}
-          --build-arg benchmark_utils_repo=${{ inputs.benchmark_utils_repo }}
-          -t "migraphx-rocm:${{ inputs.rocm_release }}-${{ steps.git_sha.outputs.git_sha }}"
-          -f dockerfiles/Daily.Dockerfile .
-
-      - name: Run ONNX model-zoo (docker)
-        if: ${{ github.event.action != 'closed' && inputs.use_docker }}
-        shell: bash
-        env:
-          GPU: ${{ env.GPU }}
-          CPU: ${{ env.CPU }}
-        run: >
-          docker run
-          --name onnx-test-$GITHUB_RUN_ID
-          --cpuset-cpus=${{ env.CPU }}
-          -e ROCR_VISIBLE_DEVICES=${{ env.GPU }}
-          -e TZ=America/Chicago
-          -e TARGET=gpu
-          -e PYTHONPATH=/src/AMDMIGraphX/build/lib
-          -e USE_RBUILD=1
-          --device=/dev/dri
-          --device=/dev/kfd
-          --network=host
-          --group-add=video
-          -v /usr/share/migraphx/saved-models:/saved-models:ro
-          -v /usr/share/migraphx/new-saved-models:/new-saved-models:ro
-          -v $GITHUB_WORKSPACE/${{ env.UTILS_DIR }}/scripts:/migraphx/sh:ro
-          -v ${{ env.TEST_RESULTS_PATH }}:/data/test-results
-          -v $GITHUB_WORKSPACE:/workspace
-          --workdir /workspace
-          migraphx-rocm:${{ inputs.rocm_release }}-${{ steps.git_sha.outputs.git_sha }} /bin/bash -lc "
-            set -euo pipefail
-            /migraphx/sh/build_migraphx.sh
-
-            if ! command -v node >/dev/null 2>&1; then
-              apt-get update -y
-              apt-get install -y --no-install-recommends ca-certificates curl gnupg
-              install -d /etc/apt/keyrings
-              curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
-              echo 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main' > /etc/apt/sources.list.d/nodesource.list
-              apt-get update -y && apt-get install -y --no-install-recommends nodejs
-            fi
-            node --version
-
-            if [ -f tools/model_zoo/test_generator/requirements.txt ]; then
-              grep -viE '^(torch|torchvision|torchaudio|onnxruntime-gpu)\b' tools/model_zoo/test_generator/requirements.txt > .req_notorch.txt || true
-              pip3 install -r .req_notorch.txt
-            fi
-
-            chmod +x tools/model_zoo/test_generator/test_models.sh || true
-            chmod +x ./run-model-zoo-tests.js || true
-
-            RUN_TS=$(date -u +%Y%m%dT%H%M%SZ)
-            ROOT=\"/data/test-results/onnx-${RUN_TS}\"
-            mkdir -p \"${ROOT}/fp16\" \"${ROOT}/fp32\"
-            echo \"${RUN_TS}\" > \"${ROOT}/run.timestamp\"
-
-            echo 'Generating ONNX test cases...'
-            node ./run-model-zoo-tests.js --datasets /saved-models --out tools/model_zoo/onnx_zoo
-
-            echo 'Running ONNX model tests...'
-            bash tools/model_zoo/test_generator/test_models.sh tools/model_zoo/onnx_zoo 2>&1 | tee \"${ROOT}/raw.log\"
-
-            shopt -s nullglob
-            for p in fp16 fp32; do
-              src=\"tools/model_zoo/test_generator/logs/$p\"
-              [ -d \"$src\" ] && cp -f \"$src\"/*.log \"${ROOT}/$p/\" || true
-            done
-
-            # ---- JS summary in a temp file (avoids heredoc issues) ----
-            cat >/tmp/onnx_summarize.js <<'JS'
-            const fs=require('fs'),path=require('path');
-            const runTs=process.env.RUN_TS||process.argv[2];
-            const rootDir=`/data/test-results/onnx-${runTs}`;
-            const precs=['fp32','fp16'];
-            const summary={totals:{pass:0,fail:0},regressions:{}};
-            function looksFailed(t){return /(Traceback \\(most recent call last\\)|\\bERROR\\b|AssertionError|Segmentation fault|^error:)/im.test(t);}
-            function failureMessage(t){
-              const tb=[...t.matchAll(/Traceback \\(most recent call last\\):([\\s\\S]*?)(?:\\n\\s*\\n|\\Z)/g)];
-              if(tb.length){
-                const block=tb[tb.length-1][1].trim().split(/\\r?\\n/).reverse();
-                for(const line of block) if(line.trim()) return line.trim();
-              }
-              const lines=t.split(/\\r?\\n/).map(l=>l.trim()).filter(Boolean).reverse();
-              for(const l of lines) if (/(error|exception|failed|segmentation fault|assert)/i.test(l)) return l;
-              return 'failed (see log)';
-            }
-            for(const prec of precs){
-              const d=path.join(rootDir,prec); const reg={passed:[],failed:[]};
-              if(fs.existsSync(d)&&fs.statSync(d).isDirectory()){
-                const files=fs.readdirSync(d).filter(f=>f.endsWith('.log')).sort();
-                for(const fn of files){
-                  const model=fn.slice(0,-4);
-                  const txt=fs.readFileSync(path.join(d,fn),'utf8');
-                  if(looksFailed(txt)){reg.failed.push({model,message:failureMessage(txt)});summary.totals.fail++;}
-                  else {reg.passed.push(model);summary.totals.pass++;}
-                }
-              }
-              summary.regressions[prec]=reg;
-            }
-            fs.writeFileSync(path.join(rootDir,'summary.json'), JSON.stringify(summary,null,2));
-            const lines=[];
-            lines.push('## Totals',`- PASS: ${summary.totals.pass}`,`- FAIL: ${summary.totals.fail}`,'');
-            for(const prec of precs){
-              const reg=summary.regressions[prec];
-              lines.push(`## ${prec.toUpperCase()}`);
-              lines.push(`**Passed (${reg.passed.length})**`);
-              if(reg.passed.length) reg.passed.forEach(m=>lines.push(`- ${m}`)); else lines.push('- none');
-              lines.push('');
-              lines.push(`**Failed (${reg.failed.length})**`);
-              if(reg.failed.length) reg.failed.forEach(it=>lines.push(`- ${it.model}: \\`${it.message}\\``)); else lines.push('- none');
-              lines.push('');
-            }
-            fs.writeFileSync(path.join(rootDir,'summary.md'), lines.join('\\n'));
-            JS
-
-            node /tmp/onnx_summarize.js \"${RUN_TS}\"
-          "
-
-      # (optional) non-docker path if you flip use_docker=false
-      - name: Run ONNX model-zoo (no docker)
-        if: ${{ github.event.action != 'closed' && !inputs.use_docker }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if ! command -v node >/dev/null 2>&1; then
-            sudo apt-get update -y
-            curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-            sudo apt-get install -y nodejs
-          fi
-          pip3 install -r tools/model_zoo/test_generator/requirements.txt
-          RUN_TS=$(date -u +%Y%m%dT%H%M%SZ)
-          ROOT="${TEST_RESULTS_PATH}/onnx-${RUN_TS}"
-          mkdir -p "${ROOT}/fp16" "${ROOT}/fp32"
-          node ./run-model-zoo-tests.js --datasets /usr/share/migraphx/saved-models --out tools/model_zoo/onnx_zoo
-          bash tools/model_zoo/test_generator/test_models.sh tools/model_zoo/onnx_zoo 2>&1 | tee "${ROOT}/raw.log"
-          for p in fp16 fp32; do
-            src="tools/model_zoo/test_generator/logs/$p"
-            [ -d "$src" ] && cp -f "$src"/*.log "${ROOT}/$p/" || true
-          done
-          cat >/tmp/onnx_summarize.js <<'JS'
-          const fs=require('fs'),path=require('path');
-          const runTs=process.env.RUN_TS||process.argv[2];
-          const rootDir=process.env.ROOT||`${process.env.TEST_RESULTS_PATH||'/data/test-results'}/onnx-${runTs}`;
-          const precs=['fp32','fp16'];
-          const summary={totals:{pass:0,fail:0},regressions:{}};
-          function looksFailed(t){return /(Traceback \(most recent call last\)|\bERROR\b|AssertionError|Segmentation fault|^error:)/im.test(t);}
-          function failureMessage(t){
-            const tb=[...t.matchAll(/Traceback \(most recent call last\):([\s\S]*?)(?:\n\s*\n|\Z)/g)];
-            if(tb.length){
-              const block=tb[tb.length-1][1].trim().split(/\r?\n/).reverse();
-              for(const line of block) if(line.trim()) return line.trim();
-            }
-            const lines=t.split(/\r?\n/).map(l=>l.trim()).filter(Boolean).reverse();
-            for(const l of lines) if (/(error|exception|failed|segmentation fault|assert)/i.test(l)) return l;
-            return 'failed (see log)';
-          }
-          for(const prec of precs){
-            const d=path.join(rootDir,prec); const reg={passed:[],failed:[]};
-            if(fs.existsSync(d)&&fs.statSync(d).isDirectory()){
-              const files=fs.readdirSync(d).filter(f=>f.endsWith('.log')).sort();
-              for(const fn of files){
-                const model=fn.slice(0,-4);
-                const txt=fs.readFileSync(path.join(d,fn),'utf8');
-                if(looksFailed(txt)){reg.failed.push({model,message:failureMessage(txt)});summary.totals.fail++;}
-                else {reg.passed.push(model);summary.totals.pass++;}
-              }
-            }
-            summary.regressions[prec]=reg;
-          }
-          fs.writeFileSync(path.join(rootDir,'summary.json'), JSON.stringify(summary,null,2));
-          const lines=[];
-          lines.push('## Totals',`- PASS: ${summary.totals.pass}`,`- FAIL: ${summary.totals.fail}`,'');
-          for(const prec of precs){
-            const reg=summary.regressions[prec];
-            lines.push(`## ${prec.toUpperCase()}`);
-            lines.push(`**Passed (${reg.passed.length})**`);
-            if(reg.passed.length) reg.passed.forEach(m=>lines.push(`- ${m}`)); else lines.push('- none');
-            lines.push('');
-            lines.push(`**Failed (${reg.failed.length})**`);
-            if(reg.failed.length) reg.failed.forEach(it=>lines.push(`- ${it.model}: \`${it.message}\``)); else lines.push('- none');
-            lines.push('');
-          }
-          fs.writeFileSync(path.join(rootDir,'summary.md'), lines.join('\n'));
-          JS
-          node /tmp/onnx_summarize.js "${RUN_TS}"
-
-      - name: Delete old images/containers
-        if: ${{ github.event_name == 'schedule' }}
-        shell: bash
-        run: |
-          docker container prune -f || true
-          if [[ $(docker images --filter=reference="migraphx-rocm:${{ inputs.rocm_release }}-*" | awk 'NR>1 {print $3}') ]]; then
-            docker rmi -f $(docker images --filter=reference="migraphx-rocm:${{ inputs.rocm_release }}-*" | awk 'NR>1 {print $3}') || true
-          fi
-          if [[ $(docker images --format "{{.Repository}}:{{.Tag}} {{.CreatedAt}}" | grep "rocm-migraphx:${{ inputs.rocm_release }}-"|awk -v date="$(date -d '2 weeks ago' +%Y-%m-%d)" '$2 < date {print $1}') ]]; then
-            docker rmi -f $(docker images --format "{{.Repository}}:{{.Tag}} {{.CreatedAt}}" | grep "rocm-migraphx:${{ inputs.rocm_release }}-"|awk -v date="$(date -d '2 weeks ago' +%Y-%m-%d)" '$2 < date {print $1}') || true
-          fi
-          docker image prune -f || true
-
-      - name: Checkout report's repo
-        if: ${{ github.event.action != 'closed' }}
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ inputs.onnx_reports_repo }}
-          path: ${{ env.REPORTS_DIR }}
           token: ${{ secrets.gh_token }}
 
-      - name: Copy ONNX results to repo - develop - nightly or manual
-        if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
-        shell: bash
-        run: |
-          ROOT=$(ls -dt ${{ env.TEST_RESULTS_PATH }}/onnx-* | head -1)
-          mkdir -p "$GITHUB_WORKSPACE/${{ env.REPORTS_DIR }}/onnx_results/develop/${{ steps.git_sha.outputs.git_sha }}"
-          cp -r "${ROOT}/." "$GITHUB_WORKSPACE/${{ env.REPORTS_DIR }}/onnx_results/develop/${{ steps.git_sha.outputs.git_sha }}"
-
-      - name: Copy ONNX results to repo - PRs
-        if: ${{ github.event_name != 'schedule' && github.event_name == 'pull_request_target' && github.event.action != 'closed' }}
-        shell: bash
-        run: |
-          ROOT=$(ls -dt ${{ env.TEST_RESULTS_PATH }}/onnx-* | head -1)
-          mkdir -p "$GITHUB_WORKSPACE/${{ env.REPORTS_DIR }}/onnx_results/PRs/PR-$PR_ID/${{ steps.git_sha.outputs.git_sha }}"
-          cp -r "${ROOT}/." "$GITHUB_WORKSPACE/${{ env.REPORTS_DIR }}/onnx_results/PRs/PR-$PR_ID/${{ steps.git_sha.outputs.git_sha }}"
-
-      - name: Push results to repo
-        continue-on-error: true
-        if: ${{ github.event.action != 'closed' }}
-        shell: bash
-        run: |
-          cd "$GITHUB_WORKSPACE/${{ env.REPORTS_DIR }}/"
-          git add .
-          git config --local user.email github-actions@github.com
-          git config --local user.name github-actions
-          git commit -m "ONNX results run https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" -a || true
-          git push || true
-
-      - name: Create ONNX comment on PR
-        if: ${{ github.event_name != 'schedule' && github.event_name == 'pull_request_target' && github.event.action != 'closed' }}
-        uses: marocchino/sticky-pull-request-comment@v2.9.0
+      - name: Checkout benchmark utils
+        uses: actions/checkout@v4
         with:
-          header: onnx
-          GITHUB_TOKEN: ${{ secrets.gh_token }}
-          path: ${{ env.TEST_RESULTS_PATH }}/$(ls -dt ${{ env.TEST_RESULTS_PATH }}/onnx-* | head -1 | xargs -I{} basename {})/summary.md
-          recreate: true
+          repository: ${{ inputs.benchmark_utils_repo }}
+          path: ${{ env.UTILS_DIR }}
+          token: ${{ secrets.gh_token }}
 
-      - name: Reset GPU parameters to default
-        if: ${{ github.event.action != 'closed' }}
-        run: sudo rocm-smi --device ${{ env.GPU }} --resetclocks
-
-      - name: Clean closed PR data
-        if: ${{ github.event.action == 'closed' }}
+      - name: Write lightweight Dockerfile (PyTorch+ROCm base)
         run: |
-          sudo rm -rf ${{ env.TEST_RESULTS_PATH }}
+          cat > Dockerfile.onnx << 'DOCKER'
+          ARG PT_TAG
+          FROM rocm/pytorch:${PT_TAG}
+
+          # Basics + Node.js (JS generator), jq, bash tools
+          RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+               ca-certificates curl gnupg build-essential git cmake pkg-config python3-pip python3-dev \
+               jq bash coreutils findutils sed gawk \
+            && install -d /etc/apt/keyrings \
+            && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+            && echo 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main' > /etc/apt/sources.list.d/nodesource.list \
+            && apt-get update && apt-get install -y --no-install-recommends nodejs \
+            && rm -rf /var/lib/apt/lists/*
+
+          # Create workdir
+          WORKDIR /workspace
+          DOCKER
+
+      - name: Build ONNX runner image
+        run: |
+          docker build \
+            --build-arg PT_TAG=${{ inputs.pytorch_base_tag }} \
+            -t onnx-pytorch-migraphx:${{ github.sha }} \
+            -f Dockerfile.onnx .
+
+      - name: Init timestamp
+        id: ts
+        run: echo "stamp=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Run ONNX tests in container
+        env:
+          RUN_TS: ${{ steps.ts.outputs.stamp }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="${{ env.TEST_RESULTS_PATH }}/onnx-${RUN_TS}"
+          mkdir -p "$ROOT/fp16" "$ROOT/fp32"
+
+          docker run --rm \
+            --name onnx-model-${GITHUB_RUN_ID} \
+            --cpuset-cpus=${{ env.CPU }} \
+            -e ROCR_VISIBLE_DEVICES=${{ env.GPU }} \
+            --device=/dev/dri --device=/dev/kfd \
+            --group-add=video --network=host \
+            -e RUN_TS=${RUN_TS} \
+            -v "$PWD:/workspace:rw" \
+            -v "${{ env.DATASETS_DIR }}:/datasets:ro" \
+            -v "${{ env.TEST_RESULTS_PATH }}:${{ env.TEST_RESULTS_PATH }}" \
+            -v "$PWD/${{ env.UTILS_DIR }}/scripts:/migraphx/sh:ro" \
+            onnx-pytorch-migraphx:${{ github.sha }} \
+            bash -lc '
+              set -euo pipefail
+              cd /workspace
+
+              # --- Install Python deps (filter out torch/onnxruntime-gpu) ---
+              if [ -f tools/model_zoo/test_generator/requirements.txt ]; then
+                grep -viE "^(torch|torchvision|torchaudio|onnxruntime-gpu)\b" tools/model_zoo/test_generator/requirements.txt > .req_notorch.txt || true
+                python3 -m pip install --upgrade pip
+                pip3 install -r .req_notorch.txt
+              fi
+
+              # --- Build MIGraphX (uses benchmark-utils script) ---
+              /migraphx/sh/build_migraphx.sh
+
+              # --- Export so Python can import + find libs ---
+              export PYTHONPATH=/src/AMDMIGraphX/build/lib:${PYTHONPATH:-}
+              export LD_LIBRARY_PATH=/src/AMDMIGraphX/build/lib:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+
+              # --- Make scripts runnable ---
+              chmod +x tools/model_zoo/test_generator/test_models.sh || true
+              chmod +x ./run-model-zoo-tests.js || true
+
+              echo "Datasets at /datasets"
+              node --version
+              python3 --version
+
+              # --- Generate cases + run tests ---
+              node ./run-model-zoo-tests.js --datasets /datasets --out tools/model_zoo/onnx_zoo
+
+              mkdir -p "'"$ROOT"'/fp16" "'"$ROOT"'/fp32"
+              bash tools/model_zoo/test_generator/test_models.sh tools/model_zoo/onnx_zoo 2>&1 | tee "'"$ROOT"'/raw.log"
+
+              # Copy per-model logs back into the timestamped folder
+              shopt -s nullglob
+              for p in fp16 fp32; do
+                src="tools/model_zoo/test_generator/logs/$p"
+                [ -d "$src" ] && cp -f "$src"/*.log "'"$ROOT"'/$p/" || true
+              done
+
+              # Summarize (write a tiny JS file to avoid heredoc quoting issues)
+              cat >/tmp/onnx_summarize.js << "JS"
+              const fs=require("fs"),path=require("path");
+              const runTs=process.env.RUN_TS;
+              const rootDir=`${process.env.TEST_RESULTS_PATH}/onnx-${runTs}`;
+              const precs=["fp32","fp16"];
+              const summary={totals:{pass:0,fail:0},regressions:{}};
+              const looksFailed=t=>/(Traceback \(most recent call last\)|\bERROR\b|AssertionError|Segmentation fault|^error:)/im.test(t);
+              function failureMessage(t){
+                const tb=[...t.matchAll(/Traceback \(most recent call last\):([\s\S]*?)(?:\n\s*\n|\Z)/g)];
+                if(tb.length){
+                  const block=tb[tb.length-1][1].trim().split(/\r?\n/).reverse();
+                  for(const line of block) if(line.trim()) return line.trim();
+                }
+                const lines=t.split(/\r?\n/).map(l=>l.trim()).filter(Boolean).reverse();
+                for(const l of lines) if (/(error|exception|failed|segmentation fault|assert)/i.test(l)) return l;
+                return "failed (see log)";
+              }
+              for(const prec of precs){
+                const d=path.join(rootDir,prec); const reg={passed:[],failed:[]};
+                if(fs.existsSync(d)&&fs.statSync(d).isDirectory()){
+                  const files=fs.readdirSync(d).filter(f=>f.endsWith(".log")).sort();
+                  for(const fn of files){
+                    const model=fn.slice(0,-4);
+                    const txt=fs.readFileSync(path.join(d,fn),"utf8");
+                    if(looksFailed(txt)){reg.failed.push({model,message:failureMessage(txt)});summary.totals.fail++;}
+                    else {reg.passed.push(model);summary.totals.pass++;}
+                  }
+                }
+                summary.regressions[prec]=reg;
+              }
+              fs.writeFileSync(path.join(rootDir,"summary.json"), JSON.stringify(summary,null,2));
+              const lines=[];
+              lines.push("## Totals",`- PASS: ${summary.totals.pass}`,`- FAIL: ${summary.totals.fail}`,"");
+              for(const prec of precs){
+                const reg=summary.regressions[prec];
+                lines.push(`## ${prec.toUpperCase()}`);
+                lines.push(`**Passed (${reg.passed.length})**`);
+                if(reg.passed.length) reg.passed.forEach(m=>lines.push(`- ${m}`)); else lines.push("- none");
+                lines.push("");
+                lines.push(`**Failed (${reg.failed.length})**`);
+                if(reg.failed.length) reg.failed.forEach(it=>lines.push(`- ${it.model}: \`${it.message}\``)); else lines.push("- none");
+                lines.push("");
+              }
+              fs.writeFileSync(path.join(rootDir,"summary.md"), lines.join("\n"));
+              JS
+              node /tmp/onnx_summarize.js
+            '
+
+      - name: Upload logs and summary (timestamped)
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-zoo-logs-${{ steps.ts.outputs.stamp }}
+          path: ${{ env.TEST_RESULTS_PATH }}/onnx-${{ steps.ts.outputs.stamp }}
+          if-no-files-found: error
