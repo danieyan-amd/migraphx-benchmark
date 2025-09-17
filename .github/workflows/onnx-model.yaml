@@ -177,7 +177,7 @@ jobs:
               done
 
               # ---- Summarize with Node (safe heredoc) ----
-              cat >/tmp/onnx_summarize.js <<'JS'
+              cat <<'EOF' >/tmp/onnx_summarize.js
               const fs = require('fs');
               const path = require('path');
               const root = '/results';
@@ -224,7 +224,7 @@ jobs:
                 lines.push('');
               }
               fs.writeFileSync(path.join(root,'summary.md'), lines.join('\n'));
-              JS
+EOF
 
               node /tmp/onnx_summarize.js
             '
