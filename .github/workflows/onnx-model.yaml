@@ -3,27 +3,14 @@ name: ONNX Model Zoo Tests (Docker-light)
 on:
   workflow_call:
     inputs:
-      rocm_release:
-        type: string
-        required: true
-      onnx_reports_repo:
-        type: string
-        required: true
-      benchmark_utils_repo:
-        type: string
-        required: true
-      organization:
-        type: string
-        required: true
-      result_number:
-        type: string
-        required: true
-      model_timeout:
-        type: string
-        required: true
+      rocm_release:        { type: string, required: true }
+      onnx_reports_repo:   { type: string, required: true }
+      benchmark_utils_repo:{ type: string, required: true }
+      organization:        { type: string, required: true }
+      result_number:       { type: string, required: true }
+      model_timeout:       { type: string, required: true }
     secrets:
-      gh_token:
-        required: true
+      gh_token: { required: true }
 
 permissions:
   contents: read
@@ -51,13 +38,26 @@ jobs:
         shell: bash
         run: echo "stamp=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
 
-      - name: Ensure datasets exist on host
+      # (Host) Sanity: show what’s under the usual dataset roots
+      - name: List datasets on host (debug)
         shell: bash
         run: |
-          if [ ! -d "${{ env.DATASETS_DIR }}" ]; then
-            echo "Datasets dir not found on host: ${{ env.DATASETS_DIR }}"
-            exit 1
-          fi
+          set -e
+          for d in \
+            /usr/share/migraphx/migraph_datasets \
+            /usr/share/migraphx/saved-models \
+            /usr/share/migraphx/new-saved-models
+          do
+            echo "==> Host path: $d"
+            if [ -d "$d" ]; then
+              echo "    exists"
+              # Count a few candidate files
+              cnt=$(find "$d" -type f \( -name '*.onnx' -o -name '*.pb' \) | head -100 | wc -l)
+              echo "    sample model files found: $cnt"
+            else
+              echo "    (missing)"
+            fi
+          done
 
       - name: Run ONNX Model Zoo in container
         shell: bash
@@ -76,14 +76,39 @@ jobs:
             -e PYTHONPATH=${PYTHONPATH} \
             -e LD_LIBRARY_PATH=${LD_LIBRARY_PATH} \
             -v /opt/rocm:/opt/rocm:ro \
-            -v "${{ env.DATASETS_DIR }}":/datasets:ro \
+            -v "/usr/share/migraphx/migraph_datasets":/datasets:ro \
+            -v /usr/share/migraphx/saved-models:/saved-models:ro \
+            -v /usr/share/migraphx/new-saved-models:/new-saved-models:ro \
             -v "$GITHUB_WORKSPACE":/workspace \
             -w /workspace \
             "${{ env.DOCKER_IMAGE }}" \
             bash -lc '
               set -euo pipefail
 
-              echo "Datasets at /datasets"
+              echo "Checking dataset candidates inside container..."
+              for d in /datasets /saved-models /new-saved-models; do
+                if [ -d "$d" ]; then
+                  c=$(find "$d" -type f \( -name "*.onnx" -o -name "*.pb" \) | head -100 | wc -l)
+                  printf "  %s: %s (sample files: %s)\n" "$d" "present" "$c"
+                else
+                  printf "  %s: missing\n" "$d"
+                fi
+              done
+
+              # Pick a dataset root that actually has model files
+              DATASET_ROOT=""
+              for cand in /datasets /saved-models /new-saved-models; do
+                if [ -d "$cand" ] && find "$cand" -type f \( -name "*.onnx" -o -name "*.pb" \) | head -1 | grep -q .; then
+                  DATASET_ROOT="$cand"
+                  break
+                fi
+              done
+
+              if [ -z "${DATASET_ROOT:-}" ]; then
+                echo "ERROR: No model files found under /datasets, /saved-models, or /new-saved-models."
+                exit 1
+              fi
+              echo "Using DATASET_ROOT=$DATASET_ROOT"
 
               # Install Node.js 20 for the JS generator (if missing)
               if ! command -v node >/dev/null 2>&1; then
@@ -94,6 +119,7 @@ jobs:
                 echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
                 apt-get update -y && apt-get install -y --no-install-recommends nodejs
               fi
+              node --version
 
               # Install test-only deps (skip torch/onnxruntime to avoid clashes with base)
               if [ -f tools/model_zoo/test_generator/requirements.txt ]; then
@@ -107,9 +133,10 @@ jobs:
               ROOT="logs/${RUN_TS}"
               mkdir -p "${ROOT}/fp16" "${ROOT}/fp32"
 
-              echo "Generating cases from datasets..."
-              node ./run-model-zoo-tests.js \
-                --datasets /datasets \
+              echo "Generating cases from datasets: $DATASET_ROOT"
+              node --trace-uncaught --unhandled-rejections=strict \
+                ./run-model-zoo-tests.js \
+                --datasets "$DATASET_ROOT" \
                 --out tools/model_zoo/onnx_zoo
 
               echo "Running model-zoo tests..."
