@@ -150,16 +150,25 @@ jobs:
           # Keep repo clean for next runs
           rm -rf tools/model_zoo/test_generator/logs/* || true
 
-      - name: Summarize results
+      - name: Summarize, compare with previous, and publish table
         shell: bash
         env:
           RESULTS_DIR: ${{ steps.results.outputs.host_results }}
+          PREV_SUMMARY: $HOME/.cache/migraphx-onnx/summary.json
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
+          mkdir -p "$(dirname "${PREV_SUMMARY}")"
           python3 scripts/summarize_onnx_logs.py \
             --results "${RESULTS_DIR}" \
             --out-json "${RESULTS_DIR}/summary.json" \
-            --out-md   "${RESULTS_DIR}/summary.md"
+            --out-md   "${RESULTS_DIR}/summary.md" \
+            --previous "${PREV_SUMMARY}" \
+            --artifact-url "${RUN_URL}" \
+            --write-index "${RESULTS_DIR}/index.md" \
+            --step-summary "${GITHUB_STEP_SUMMARY}"
+          # persist current summary for next run's comparison
+          cp -f "${RESULTS_DIR}/summary.json" "${PREV_SUMMARY}" || true
 
       - name: Upload logs and summary (timestamped)
         uses: actions/upload-artifact@v4
