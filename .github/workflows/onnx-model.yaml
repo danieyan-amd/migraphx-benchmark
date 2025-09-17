@@ -254,7 +254,7 @@ jobs:
             "${DOCKER_IMAGE}" \
             bash /in_container.sh
 
-          # Ensure repo tree is cleanable by checkout next runs
+          # Ensure repo tree is cleanable by checkout next runs (ignore permission errors)
           rm -rf tools/model_zoo/test_generator/logs/* || true
 
       - name: Upload logs and summary (timestamped)
