@@ -1,217 +1,178 @@
-name: ONNX Model Zoo Tests (No Docker)
+name: MIGraphX ONNX Model Tests (no Docker)
 
 on:
   workflow_call:
     inputs:
       rocm_release:
-        type: string
-        required: false
-        description: "ROCm release label; if empty, auto-detect from host"
-      onnx_reports_repo:
-        type: string
-        required: false
-        description: "owner/repo to push reports to (optional)"
-      benchmark_utils_repo:
-        type: string
-        required: false
-        description: "owner/repo with shared summary scripts (optional)"
-      organization:
-        type: string
-        required: false
-        description: "Org/layout hint; default is the caller's repo owner"
-      result_number:
-        type: string
-        required: false
-        default: "1"
-        description: "How many prior results to compare against"
-      model_timeout:
+        description: ROCm Version (parity only)
         type: string
         required: true
-        description: "Per-model timeout (seconds)"
-
+      onnx_reports_repo:
+        description: Repo where ONNX reports are stored (optional downstream)
+        type: string
+        required: true
+      benchmark_utils_repo:
+        description: Repo for utils (parity only)
+        type: string
+        required: true
+      organization:
+        description: Organization (used for paths if needed)
+        type: string
+        required: true
+      result_number:
+        description: Last N results (parity only)
+        type: string
+        required: true
+      model_timeout:
+        description: Per-model timeout (parity only)
+        type: string
+        required: true
     secrets:
       gh_token:
+        description: GitHub token (optional; only if you need to checkout other repos)
         required: false
-        description: "Token for pushing reports to onnx_reports_repo (if used)"
+
+permissions:
+  contents: read
+
+env:
+  # Datasets and ROCm libs expected on the self-hosted runner
+  DATASETS_DIR: /usr/share/migraphx/migraph_datasets
+  PYTHONPATH: /opt/rocm/lib
+  LD_LIBRARY_PATH: /opt/rocm/lib
+  LOG_ROOT: logs
 
 jobs:
   model-zoo-tests:
     runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 60
-    permissions:
-      contents: write   # allow pushing to reports repo if configured
-      actions: read     # allow listing artifacts for comparison
-    env:
-      DATASETS_DIR: /usr/share/migraphx/migraph_datasets
-      PYTHONPATH: /opt/rocm/lib:${{ env.PYTHONPATH }}
-      LD_LIBRARY_PATH: /opt/rocm/lib:${{ env.LD_LIBRARY_PATH }}
+    timeout-minutes: 90
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Detect ROCm version (if input empty)
-        id: rocm
-        shell: bash
-        run: |
-          if [[ -n "${{ inputs.rocm_release }}" ]]; then
-            echo "value=${{ inputs.rocm_release }}" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          ver="unknown"
-          if [[ -f /opt/rocm/rocm-release ]]; then
-            ver=$(sed -n 's/^ROCM_VERSION=//p' /opt/rocm/rocm-release | tr -d '"')
-          elif command -v rocminfo >/dev/null 2>&1; then
-            ver=$(rocminfo 2>/dev/null | awk -F: '/amdllvm version/ {print $2; exit}' | xargs)
-          fi
-          echo "value=$ver" >> "$GITHUB_OUTPUT"
-
-      - name: Resolve organization default
-        id: org
-        run: |
-          org="${{ inputs.organization }}"
-          if [[ -z "$org" ]]; then org="${{ github.repository_owner }}"; fi
-          echo "value=$org" >> "$GITHUB_OUTPUT"
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install test deps
-        run: |
-          pip install -r tools/model_zoo/test_generator/requirements.txt
-          # if your runner needs anything else (onnx, tqdm, pandas, etc.):
-          pip install onnx tqdm pandas
-
-      - name: (Optional) Checkout benchmark utils
-        if: ${{ inputs.benchmark_utils_repo != '' }}
+      - name: Checkout sources
         uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.benchmark_utils_repo }}
-          path: _utils
+          clean: false  # avoid failing if prior files are not deletable
 
-      - name: Init run metadata
-        id: meta
+      - name: Init timestamp
+        id: ts
+        run: echo "stamp=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Choose results directory
+        id: results
+        shell: bash
         run: |
-          stamp=$(date -u +%Y%m%dT%H%M%SZ)
-          echo "stamp=$stamp" >> "$GITHUB_OUTPUT"
-          mkdir -p logs results
+          set -euo pipefail
+          RUN_TS="${{ steps.ts.outputs.stamp }}"
+          RES_DIR="${RUNNER_TEMP}/onnx-${RUN_TS}"
+          mkdir -p "$RES_DIR/fp16" "$RES_DIR/fp32"
+          echo "run_ts=$RUN_TS" >> "$GITHUB_OUTPUT"
+          echo "host_results=$RES_DIR" >> "$GITHUB_OUTPUT"
+          echo "Using $RES_DIR for artifacts"
 
-      - name: Run ONNX model zoo tests
-        id: run
+      - name: List datasets on host (debug)
+        shell: bash
+        run: |
+          set -e
+          for d in \
+            /usr/share/migraphx/migraph_datasets \
+            /usr/share/migraphx/saved-models \
+            /usr/share/migraphx/new-saved-models
+          do
+            echo "==> Host path: $d"
+            if [ -d "$d" ]; then
+              if find "$d" -type f \( -name '*.onnx' -o -name '*.pb' \) -print -quit | grep -q . ; then
+                echo "    contains model files"
+              else
+                echo "    (no .onnx/.pb files found)"
+              fi
+            else
+              echo "    (missing)"
+            fi
+          done
+
+      - name: Run Model Zoo tests on host (no Docker)
         shell: bash
         env:
-          MODEL_TIMEOUT: ${{ inputs.model_timeout }}
+          RUN_TS: ${{ steps.results.outputs.run_ts }}
         run: |
           set -euo pipefail
-          echo "ROCm: ${{ steps.rocm.outputs.value }}"
-          echo "Org:  ${{ steps.org.outputs.value }}"
-          # Example runner call; replace with your real entry point:
-          # Pass the timeout; write per-model logs under ./logs; JSON summary to ./results/summary.json
-          bash tools/model_zoo/test_models.sh \
-            --datasets "$DATASETS_DIR" \
-            --timeout "${MODEL_TIMEOUT}" \
-            --logdir "logs" \
-            --summary "results/summary.json"
 
-      - name: (Optional) Compare with previous results
-        id: compare
-        if: ${{ inputs.result_number != '0' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Expect a local current summary at results/summary.json
-          if [[ ! -f results/summary.json ]]; then
-            echo "No current summary.json; skipping comparison."
+          # Normalize line endings (no-op on Linux)
+          sed -i 's/\r$//' tools/model_zoo/test_generator/test_models.sh || true
+
+          if [ ! -d "${DATASETS_DIR}" ]; then
+            echo "Datasets dir not found on host: ${DATASETS_DIR}"
+            exit 1
+          fi
+
+          # Bail fast if no models present
+          if ! find "${DATASETS_DIR}" -type f \( -name '*.onnx' -o -name '*.pb' \) -print -quit | grep -q . ; then
+            echo "No .onnx/.pb files under ${DATASETS_DIR}. Skipping run."
+            mkdir -p "${{ steps.results.outputs.host_results }}"
+            printf '## Totals\n- PASS: 0\n- FAIL: 0\n' > "${{ steps.results.outputs.host_results }}/summary.md"
+            printf '{"totals":{"pass":0,"fail":0},"regressions":{"fp32":{"passed":[],"failed":[]},"fp16":{"passed":[],"failed":[]}}}\n' > "${{ steps.results.outputs.host_results }}/summary.json"
             exit 0
           fi
 
-          # Strategy options:
-          #  A) Use a util script (preferred if available)
-          if [[ -d _utils && -f _utils/compare.py ]]; then
-            python _utils/compare.py \
-              --current results/summary.json \
-              --previous-count "${{ inputs.result_number }}" \
-              --out results/compare.json || true
-          else
-          #  B) Minimal inline comparison (placeholder): compute pass rate only
-            python - <<'PY'
-import json, sys
-cur=json.load(open('results/summary.json'))
-total=len(cur.get('models',[]))
-passed=sum(1 for m in cur.get('models',[]) if m.get('status')=='pass')
-rate= (100.0*passed/total) if total else 0.0
-json.dump({"current":{"total":total,"passed":passed,"pass_rate":rate}}, open('results/compare.json','w'))
-PY
-          fi
+          chmod +x tools/model_zoo/test_generator/test_models.sh || true
 
-      - name: Emit Job Summary (table with log links)
-        id: summary
+          echo "Checking dataset candidates on host..."
+          for d in /usr/share/migraphx/migraph_datasets "${DATASETS_DIR}"; do
+            if [ -d "$d" ]; then
+              if find "$d" -type f \( -name "*.onnx" -o -name "*.pb" \) -print -quit | grep -q . ; then
+                printf "  %s: present (has model files)\n" "$d"
+              else
+                printf "  %s: present (no model files)\n" "$d"
+              fi
+            else
+              printf "  %s: missing\n" "$d"
+            fi
+          done
+
+          DATASET_ROOT="${DATASETS_DIR}"
+
+          echo "Running model-zoo tests from ${DATASET_ROOT}..."
+          bash tools/model_zoo/test_generator/test_models.sh "${DATASET_ROOT}" 2>&1 | tee "${{ steps.results.outputs.host_results }}/raw.log"
+
+          # Copy per-precision logs to results dir if present
+          shopt -s nullglob
+          mkdir -p "${{ steps.results.outputs.host_results }}/fp16" "${{ steps.results.outputs.host_results }}/fp32"
+          for p in fp16 fp32; do
+            src="tools/model_zoo/test_generator/logs/$p"
+            if [ -d "$src" ]; then
+              files=( "$src"/*.log )
+              if [ -e "${files[0]}" ]; then
+                cp -f "${files[@]}" "${{ steps.results.outputs.host_results }}/$p/"
+              fi
+            fi
+          done
+
+          # Keep repo clean for next runs
+          rm -rf tools/model_zoo/test_generator/logs/* || true
+
+      - name: Summarize, compare with previous, and publish table
         shell: bash
+        env:
+          RESULTS_DIR: ${{ steps.results.outputs.host_results }}
+          PREV_SUMMARY: $HOME/.cache/migraphx-onnx/summary.json
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          echo "## ONNX Model Zoo — ROCm ${{ steps.rocm.outputs.value }} — ${{ steps.meta.outputs.stamp }}" >> "$GITHUB_STEP_SUMMARY"
-          if [[ -f results/summary.json ]]; then
-            python - <<'PY'
-import json, os
-sd=json.load(open('results/summary.json'))
-rows=[]
-for m in sd.get('models', []):
-  name=m.get('name','?')
-  status=m.get('status','?')
-  # assuming logs/<name>.txt created by your runner
-  log=f"logs/{name}.txt"
-  loglink=f"{log}" if os.path.exists(log) else ""
-  rows.append((name,status,loglink))
-print("| Model | Status | Log |")
-print("|---|---|---|")
-for n,s,l in rows:
-  cell = f"[view]({l})" if l else ""
-  print(f"| {n} | {s} | {cell} |")
-PY
-          fi
-          if [[ -f results/compare.json ]]; then
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "### Comparison" >> "$GITHUB_STEP_SUMMARY"
-            python - <<'PY'
-import json
-cmp=json.load(open('results/compare.json'))
-print("```json")
-print(json.dumps(cmp, indent=2))
-print("```")
-PY
-          fi
+          mkdir -p "$(dirname "${PREV_SUMMARY}")"
+          python3 scripts/summarize_onnx_logs.py \
+            --results "${RESULTS_DIR}" \
+            --out-json "${RESULTS_DIR}/summary.json" \
+            --out-md   "${RESULTS_DIR}/summary.md" \
+            --previous "${PREV_SUMMARY}" \
+            --artifact-url "${RUN_URL}" \
+            --write-index "${RESULTS_DIR}/index.md" \
+            --step-summary "${GITHUB_STEP_SUMMARY}"
+          # persist current summary for next run's comparison
+          cp -f "${RESULTS_DIR}/summary.json" "${PREV_SUMMARY}" || true
 
-      - name: Upload artifacts (logs & results)
+      - name: Upload logs and summary (timestamped)
         uses: actions/upload-artifact@v4
         with:
-          name: onnx-model-zoo-${{ steps.meta.outputs.stamp }}
-          path: |
-            logs/**
-            results/**
-
-      - name: (Optional) Publish reports to repo
-        if: ${{ inputs.onnx_reports_repo != '' && secrets.gh_token != '' }}
-        env:
-          GH_TOKEN: ${{ secrets.gh_token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          repo="${{ inputs.onnx_reports_repo }}"
-          work="_reports"
-          rm -rf "$work"
-          git clone "https://github.com/${repo}.git" "$work"
-          cp -r results "$work/${{ steps.meta.outputs.stamp }}"
-          # Optionally copy a compact README/index update generated by utils:
-          if [[ -d _utils && -f _utils/render_markdown.py ]]; then
-            python _utils/render_markdown.py \
-              --current "$work/${{ steps.meta.outputs.stamp }}/summary.json" \
-              --out "$work/README.md" || true
-          fi
-          pushd "$work"
-            git config user.name "github-actions"
-            git config user.email "github-actions@github.com"
-            git add -A
-            git commit -m "ONNX report: ${{ steps.meta.outputs.stamp }} (ROCm ${{ steps.rocm.outputs.value }})" || exit 0
-            git push
-          popd
+          name: model-zoo-logs-${{ steps.results.outputs.run_ts }}
+          path: ${{ steps.results.outputs.host_results }}
+          if-no-files-found: error
