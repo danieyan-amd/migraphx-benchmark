@@ -29,7 +29,7 @@ on:
         required: true
     secrets:
       gh_token:
-        description: GitHub token with push access to ROCm/migraphx-reports
+        description: GitHub token with push access to danieyan-amd/migraphx-reports
         required: true
 
 # needs write perms to push to the reports repo
@@ -171,11 +171,11 @@ jobs:
           path: ${{ steps.results.outputs.host_results }}
           if-no-files-found: error
 
-      # ===== New: publish to ROCm/migraphx-reports =====
+      # ===== New: publish to danieyan-amd/migraphx-reports =====
       - name: Checkout migraphx-reports
         uses: actions/checkout@v4
         with:
-          repository: ROCm/migraphx-reports
+          repository: danieyan-amd/migraphx-reports
           ref: main
           path: reports
           token: ${{ secrets.gh_token }}
