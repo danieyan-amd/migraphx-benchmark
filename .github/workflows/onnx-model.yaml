@@ -31,8 +31,6 @@ on:
       gh_token:
         description: GitHub token with push access to danieyan-amd/migraphx-reports
         required: true
-
-# needs write perms to push to the reports repo
 permissions:
   contents: write
 
@@ -171,7 +169,7 @@ jobs:
           path: ${{ steps.results.outputs.host_results }}
           if-no-files-found: error
 
-      # ===== New: publish to danieyan-amd/migraphx-reports =====
+      # publish to danieyan-amd/migraphx-reports for now
       - name: Checkout migraphx-reports
         uses: actions/checkout@v4
         with:
@@ -199,7 +197,7 @@ jobs:
               cp -rf "${RESULTS_DIR}/${p}/"*.log "$DEST/${p}/" || true
             fi
           done
-          # update simple index list (JSON) to make it easy to find newest runs
+          
           python3 - <<'PY'
           import json, pathlib
           from datetime import datetime
@@ -212,7 +210,6 @@ jobs:
                   items = json.loads(idx.read_text())
               except Exception:
                   items = []
-          # drop duplicate if any, then prepend this run
           items = [it for it in items if it.get("run_ts") != run_ts]
           items.insert(0, {"run_ts": run_ts, "path": f"onnx-models/{run_ts}"})
           idx.write_text(json.dumps(items, indent=2) + "\n")
