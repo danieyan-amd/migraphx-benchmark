@@ -1,4 +1,4 @@
-name: MIGraphX ONNX Model Tests (no Docker)
+name: MIGraphX ONNX Model Tests
 
 on:
   workflow_call:
