@@ -1,0 +1,248 @@
+name: MIGraphX ONNX Model Tests
+
+on:
+  workflow_call:
+    inputs:
+      rocm_release:
+        description: ROCm Version (parity only)
+        type: string
+        required: true
+      onnx_reports_repo:
+        description: Repo where ONNX reports are stored (optional downstream)
+        type: string
+        required: true
+      benchmark_utils_repo:
+        description: Repo for utils (parity only)
+        type: string
+        required: true
+      organization:
+        description: Organization (used for paths if needed)
+        type: string
+        required: true
+      result_number:
+        description: Last N results (parity only)
+        type: string
+        required: true
+      model_timeout:
+        description: Per-model timeout (parity only)
+        type: string
+        required: true
+    secrets:
+      gh_token:
+        description: GitHub token with push access to danieyan-amd/migraphx-reports
+        required: true
+permissions:
+  contents: write
+
+env:
+  DATASETS_DIR: /usr/share/migraphx/migraph_datasets
+  PYTHONPATH: /opt/rocm/lib
+  LD_LIBRARY_PATH: /opt/rocm/lib
+  LOG_ROOT: logs
+
+jobs:
+  model-zoo-tests:
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Init timestamp
+        id: ts
+        run: echo "stamp=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Choose results directory
+        id: results
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUN_TS="${{ steps.ts.outputs.stamp }}"
+          RES_DIR="${RUNNER_TEMP}/onnx-${RUN_TS}"
+          mkdir -p "$RES_DIR/fp16" "$RES_DIR/fp32"
+          echo "run_ts=$RUN_TS" >> "$GITHUB_OUTPUT"
+          echo "host_results=$RES_DIR" >> "$GITHUB_OUTPUT"
+          echo "Using $RES_DIR for artifacts"
+
+      - name: List datasets on host (debug)
+        shell: bash
+        run: |
+          set -e
+          for d in \
+            /usr/share/migraphx/migraph_datasets \
+            /usr/share/migraphx/saved-models \
+            /usr/share/migraphx/new-saved-models
+          do
+            echo "==> Host path: $d"
+            if [ -d "$d" ]; then
+              if find "$d" -type f \( -name '*.onnx' -o -name '*.pb' \) -print -quit | grep -q . ; then
+                echo "    contains model files"
+              else
+                echo "    (no .onnx/.pb files found)"
+              fi
+            else
+              echo "    (missing)"
+            fi
+          done
+
+      - name: Run Model Zoo tests on host (no Docker)
+        shell: bash
+        env:
+          RUN_TS: ${{ steps.results.outputs.run_ts }}
+        run: |
+          set -euo pipefail
+          sed -i 's/\r$//' tools/model_zoo/test_generator/test_models.sh || true
+
+          if [ ! -d "${DATASETS_DIR}" ]; then
+            echo "Datasets dir not found on host: ${DATASETS_DIR}"
+            exit 1
+          fi
+
+          if ! find "${DATASETS_DIR}" -type f \( -name '*.onnx' -o -name '*.pb' \) -print -quit | grep -q . ; then
+            echo "No .onnx/.pb files under ${DATASETS_DIR}. Skipping run."
+            mkdir -p "${{ steps.results.outputs.host_results }}"
+            printf '## Totals\n- PASS: 0\n- FAIL: 0\n' > "${{ steps.results.outputs.host_results }}/summary.md"
+            printf '{"totals":{"pass":0,"fail":0},"regressions":{"fp32":{"passed":[],"failed":[]},"fp16":{"passed":[],"failed":[]}}}\n' > "${{ steps.results.outputs.host_results }}/summary.json"
+            exit 0
+          fi
+
+          chmod +x tools/model_zoo/test_generator/test_models.sh || true
+
+          echo "Checking dataset candidates on host..."
+          for d in /usr/share/migraphx/migraph_datasets "${DATASETS_DIR}"; do
+            if [ -d "$d" ]; then
+              if find "$d" -type f \( -name "*.onnx" -o -name "*.pb" \) -print -quit | grep -q . ; then
+                printf "  %s: present (has model files)\n" "$d"
+              else
+                printf "  %s: present (no model files)\n" "$d"
+              fi
+            else
+              printf "  %s: missing\n" "$d"
+            fi
+          done
+
+          DATASET_ROOT="${DATASETS_DIR}"
+
+          echo "Running model-zoo tests from ${DATASET_ROOT}..."
+          bash tools/model_zoo/test_generator/test_models.sh "${DATASET_ROOT}" 2>&1 | tee "${{ steps.results.outputs.host_results }}/raw.log"
+
+          shopt -s nullglob
+          mkdir -p "${{ steps.results.outputs.host_results }}/fp16" "${{ steps.results.outputs.host_results }}/fp32"
+          for p in fp16 fp32; do
+            src="tools/model_zoo/test_generator/logs/$p"
+            if [ -d "$src" ]; then
+              files=( "$src"/*.log )
+              if [ -e "${files[0]}" ]; then
+                cp -f "${files[@]}" "${{ steps.results.outputs.host_results }}/$p/"
+              fi
+            fi
+          done
+
+          rm -rf tools/model_zoo/test_generator/logs/* || true
+
+      - name: Summarize, compare with previous, and publish table
+        shell: bash
+        env:
+          RESULTS_DIR: ${{ steps.results.outputs.host_results }}
+          PREV_SUMMARY: $HOME/.cache/migraphx-onnx/summary.json
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "${PREV_SUMMARY}")"
+          python3 scripts/summarize_onnx_logs.py \
+            --results "${RESULTS_DIR}" \
+            --out-json "${RESULTS_DIR}/summary.json" \
+            --out-md   "${RESULTS_DIR}/summary.md" \
+            --previous "${PREV_SUMMARY}" \
+            --artifact-url "${RUN_URL}" \
+            --write-index "${RESULTS_DIR}/index.md" \
+            --step-summary "${GITHUB_STEP_SUMMARY}"
+          cp -f "${RESULTS_DIR}/summary.json" "${PREV_SUMMARY}" || true
+
+      - name: Upload logs and summary (timestamped)
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-zoo-logs-${{ steps.results.outputs.run_ts }}
+          path: ${{ steps.results.outputs.host_results }}
+          if-no-files-found: error
+
+      # publish to danieyan-amd/migraphx-reports for now
+      - name: Checkout migraphx-reports
+        uses: actions/checkout@v4
+        with:
+          repository: danieyan-amd/migraphx-reports
+          ref: main
+          path: reports
+          token: ${{ secrets.gh_token }}
+
+      - name: Stage ONNX results into reports repo
+        shell: bash
+        env:
+          RESULTS_DIR: ${{ steps.results.outputs.host_results }}
+          RUN_TS: ${{ steps.results.outputs.run_ts }}
+        run: |
+          set -euo pipefail
+          DEST="reports/onnx-models/${RUN_TS}"
+          mkdir -p "$DEST"
+          cp -f "${RESULTS_DIR}/summary.json" "$DEST/" || true
+          cp -f "${RESULTS_DIR}/summary.md"   "$DEST/" || true
+          cp -f "${RESULTS_DIR}/index.md"     "$DEST/" || true
+          # copy per-precision logs if present
+          for p in fp16 fp32; do
+            if [ -d "${RESULTS_DIR}/${p}" ]; then
+              mkdir -p "$DEST/${p}"
+              cp -rf "${RESULTS_DIR}/${p}/"*.log "$DEST/${p}/" || true
+            fi
+          done
+          
+          python3 - <<'PY'
+          import json, pathlib
+          from datetime import datetime
+          run_ts = "${RUN_TS}"
+          dest = pathlib.Path("reports/onnx-models")
+          idx = dest / "index.json"
+          items = []
+          if idx.exists():
+              try:
+                  items = json.loads(idx.read_text())
+              except Exception:
+                  items = []
+          items = [it for it in items if it.get("run_ts") != run_ts]
+          items.insert(0, {"run_ts": run_ts, "path": f"onnx-models/{run_ts}"})
+          idx.write_text(json.dumps(items, indent=2) + "\n")
+          PY
+
+      - name: Commit & push results branch
+        working-directory: reports
+        env:
+          GH_EMAIL: actions@github.com
+          GH_NAME: github-actions
+          RUN_TS: ${{ steps.results.outputs.run_ts }}
+        run: |
+          set -e
+          git config user.email "$GH_EMAIL"
+          git config user.name "$GH_NAME"
+          git checkout -b "onnx-${RUN_TS}"
+          git add onnx-models
+          # commit only if there are changes
+          if git diff --staged --quiet; then
+            echo "Nothing to commit (no changes)."
+            exit 0
+          fi
+          git commit -m "ONNX results: ${RUN_TS} (from ${{ github.repository }} run ${{ github.run_id }})"
+          git push -u origin "onnx-${RUN_TS}"
+
+      - name: Open PR to migraphx-reports
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.gh_token }}
+          path: reports
+          commit-message: "ONNX results: ${{ steps.results.outputs.run_ts }}"
+          title: "ONNX results ${{ steps.results.outputs.run_ts }}"
+          body: |
+            Published from ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          branch: onnx-${{ steps.results.outputs.run_ts }}
+          base: main
